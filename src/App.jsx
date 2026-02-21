@@ -313,6 +313,42 @@ export default function App() {
     });
   }, [chartData]);
 
+  // Generate Advanced Statistical Analysis
+  const advancedStats = useMemo(() => {
+    const thresholds = [1.5, 2.0, 2.5, 3.0];
+    const totalDataPoints = chartData.length;
+
+    if (totalDataPoints === 0) return [];
+
+    return thresholds.map(threshold => {
+      // Find days that met the RVol threshold
+      const daysMeetingRvol = chartData.filter(d => d.rVol >= threshold);
+      const denominator = daysMeetingRvol.length;
+
+      // From those days, find how many ALSO hit High Excursion (>= 1.5)
+      const daysMeetingBoth = daysMeetingRvol.filter(d => d.maxExcursionAdr >= 1.5);
+      const numerator = daysMeetingBoth.length;
+
+      // Calculate the conditional probability
+      const probability = denominator > 0 ? (numerator / denominator) * 100 : 0;
+
+      // Calculate overall frequency of this setup playing out relative to all days
+      const overallFrequency = (numerator / totalDataPoints) * 100;
+
+      // Calculate average excursion for this specific RVol group
+      const avgExcursion = denominator > 0 ? daysMeetingRvol.reduce((sum, d) => sum + d.maxExcursionAdr, 0) / denominator : 0;
+
+      return {
+        threshold: threshold.toFixed(1),
+        totalMatchingDays: denominator,
+        highExcursionDays: numerator,
+        probability: probability.toFixed(2),
+        overallFrequency: overallFrequency.toFixed(2),
+        avgExcursion: avgExcursion.toFixed(2)
+      };
+    });
+  }, [chartData]);
+
   // Calculate RVol Distribution for Bell Curve
   const { rvolDistributionData, rvolStats } = useMemo(() => {
     if (!chartData || chartData.length === 0) return { rvolDistributionData: [], rvolStats: null };
@@ -466,22 +502,6 @@ export default function App() {
         x: rx, y: sortedChartData.map(d => d.regressionY),
         mode: 'lines', type: 'scatter', name: 'Trendline', line: { color: '#ef4444', width: 2 }, hoverinfo: 'skip'
       });
-      traces.push({
-        x: rx, y: sortedChartData.map(d => d.regressionYPlus1SD),
-        mode: 'lines', type: 'scatter', name: '+1 SD', line: { color: '#f97316', width: 1, dash: 'dash' }, hoverinfo: 'skip'
-      });
-      traces.push({
-        x: rx, y: sortedChartData.map(d => d.regressionYMinus1SD),
-        mode: 'lines', type: 'scatter', name: '-1 SD', line: { color: '#f97316', width: 1, dash: 'dash' }, hoverinfo: 'skip'
-      });
-      traces.push({
-        x: rx, y: sortedChartData.map(d => d.regressionYPlus2SD),
-        mode: 'lines', type: 'scatter', name: '+2 SD', line: { color: '#eab308', width: 1, dash: 'dot' }, hoverinfo: 'skip'
-      });
-      traces.push({
-        x: rx, y: sortedChartData.map(d => d.regressionYMinus2SD),
-        mode: 'lines', type: 'scatter', name: '-2 SD', line: { color: '#eab308', width: 1, dash: 'dot' }, hoverinfo: 'skip'
-      });
     }
 
     // Top Marginal: RVol Bell Curve
@@ -542,6 +562,7 @@ export default function App() {
       },
       yaxis: {
         domain: [0, 0.85],
+        range: [0, Math.max(2.0, Math.max(...y) * 1.05)],
         showgrid: true,
         gridcolor: '#e2e8f0',
         showline: true,
@@ -580,9 +601,9 @@ export default function App() {
           xref: 'x',
           yref: 'y',
           x0: 1.5, // Profitable Zone RVol threshold
-          y0: 1.0, // Profitable Zone Excursion threshold
+          y0: 1.5, // Profitable Zone Excursion threshold
           x1: Math.max(1.5, Math.max(...x) * 1.05), // Dynamic upper bound based precisely on actual data points
-          y1: Math.max(1.0, Math.max(...y) * 1.05),
+          y1: Math.max(1.5, Math.max(...y) * 1.05),
           fillcolor: 'rgba(34, 197, 94, 0.1)', // Light green shade
           line: {
             width: 1.5,
@@ -947,9 +968,54 @@ export default function App() {
           </div>
         </div>
 
+        {/* Advanced Statistical Analysis: High Excursion Probabilities */}
+        {advancedStats.length > 0 && (
+          <div className="bg-white border border-slate-200 rounded-xl shadow-sm mt-6 overflow-hidden">
+            <div className="bg-slate-50 border-b border-slate-200 p-4">
+              <h3 className="text-md font-bold text-slate-800">Advanced High-Excursion Probabilities</h3>
+              <p className="text-xs text-slate-500 mt-1">Historically analyzing the percentage of days that push a <strong>High Excursion (&ge; 1.5 ADR)</strong> once an RVol threshold is breached.</p>
+            </div>
+            <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              {advancedStats.map((stat, idx) => (
+                <div key={idx} className="bg-slate-50 rounded-lg p-4 border border-slate-100 flex flex-col justify-between">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">RVol threshold</div>
+                    <div className="text-lg font-bold text-slate-800 bg-white border border-slate-200 inline-block px-2 py-1 rounded shadow-sm">
+                      &ge; {stat.threshold}x
+                    </div>
+                  </div>
 
+                  <div className="mt-4">
+                    <div className="flex justify-between items-end mb-1">
+                      <span className="text-sm font-medium text-slate-700">Win Rate:</span>
+                      <span className="text-xl font-bold text-green-600">{stat.probability}%</span>
+                    </div>
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 mb-3">
+                      <div className="bg-green-500 h-1.5 rounded-full" style={{ width: `${stat.probability}%` }}></div>
+                    </div>
 
-        {/* Selected Ticker Stock Chart */}
+                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                      <span>Total Signal Days:</span>
+                      <span className="font-semibold text-slate-700">{stat.totalMatchingDays}</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                      <span>High Excursion Hits:</span>
+                      <span className="font-semibold text-green-700">{stat.highExcursionDays}</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                      <span>Avg. Excursion for Group:</span>
+                      <span className="font-semibold text-blue-600">{stat.avgExcursion}x</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-500 pt-2 mt-2 border-t border-slate-200">
+                      <span>Overall Frequency:</span>
+                      <span className="font-semibold">{stat.overallFrequency}%</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}        {/* Selected Ticker Stock Chart */}
         {selectedTickerFilter !== 'ALL' && apexChartState && (
           <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mt-6">
             <div className="mb-4">
