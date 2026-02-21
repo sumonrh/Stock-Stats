@@ -1,0 +1,457 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { ComposedChart, Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+
+// --- CONFIGURATION ---
+const INITIAL_TICKERS = ['SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC'];
+
+const BINS = [
+  { label: '< 0.5x', min: 0, max: 0.5 },
+  { label: '0.5x - 1.0x', min: 0.5, max: 1.0 },
+  { label: '1.0x - 1.5x', min: 1.0, max: 1.5 },
+  { label: '1.5x - 2.0x', min: 1.5, max: 2.0 },
+  { label: '2.0x - 3.0x', min: 2.0, max: 3.0 },
+  { label: '3.0x - 5.0x', min: 3.0, max: 5.0 },
+  { label: '> 5.0x', min: 5.0, max: Infinity }
+];
+
+// --- MATH HELPERS ---
+const getMedian = (arr) => {
+  if (!arr || arr.length === 0) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+const getMean = (arr) => {
+  if (!arr || arr.length === 0) return null;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+};
+
+// Calculates Least Squares Linear Regression: y = mx + b
+const calculateRegression = (data) => {
+  if (!data || data.length < 2) return null;
+  
+  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  let n = 0;
+
+  data.forEach(d => {
+    const x = d.rVol;
+    const y = d.maxExcursionAdr;
+    if (x != null && y != null && isFinite(x) && isFinite(y)) {
+      sumX += x;
+      sumY += y;
+      sumXY += x * y;
+      sumXX += x * x;
+      n++;
+    }
+  });
+
+  if (n < 2) return null;
+
+  const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+  const intercept = (sumY - slope * sumX) / n;
+
+  return { slope, intercept, equation: `y = ${slope.toFixed(4)}x + ${intercept.toFixed(4)}` };
+};
+
+// --- DATA SIMULATION & PROCESSING ---
+// Simulates 1 year of realistic daily stock data as a fallback
+const generateMockData = (ticker) => {
+  const data = [];
+  let currentPrice = 20 + Math.random() * 80;
+  let baseVolume = 1000000 + Math.random() * 5000000;
+  const now = new Date();
+  
+  for (let i = 400; i >= 0; i--) {
+    const date = new Date(now);
+    date.setDate(date.getDate() - i);
+    
+    if (date.getDay() === 0 || date.getDay() === 6) continue;
+
+    const normalVolatility = 0.03;
+    let changePct = (Math.random() - 0.5) * normalVolatility * 2;
+    let volume = baseVolume * (0.6 + Math.random() * 0.8);
+    
+    const isCatalyst = Math.random() > 0.92;
+    if (isCatalyst) {
+       volume *= (2 + Math.random() * 4);
+       changePct = (Math.random() - 0.5) * normalVolatility * 8;
+    }
+
+    const open = currentPrice;
+    const close = open * (1 + changePct);
+    
+    const maxOC = Math.max(open, close);
+    const minOC = Math.min(open, close);
+    const high = maxOC * (1 + Math.random() * 0.015);
+    const low = minOC * (1 - Math.random() * 0.015);
+    
+    data.push({ date, open, high, low, close, volume });
+    currentPrice = close;
+  }
+  return data;
+};
+
+// Applies the specific (High - Open) / ADR Dollar Math
+const processTickerData = (data, ticker, rvolPeriod, adrPeriod) => {
+  const result = [];
+  const maxDaysNeeded = Math.max(rvolPeriod, adrPeriod);
+  
+  for (let i = 0; i < data.length; i++) {
+    let current = { ...data[i], ticker };
+    
+    // Absolute dollar range from open to high for the day
+    current.openToHighRange = current.high - current.open;
+
+    // Calculate rolling averages (shifted by 1 day)
+    if (i >= maxDaysNeeded) {
+      let volSum = 0;
+      let adrDollarSum = 0;
+      
+      for (let j = 1; j <= rvolPeriod; j++) {
+        volSum += data[i - j].volume;
+      }
+      for (let j = 1; j <= adrPeriod; j++) {
+        adrDollarSum += (data[i - j].high - data[i - j].low); // Summing historical dollar ranges
+      }
+      
+      current.avgVol = volSum / rvolPeriod;
+      current.adrDollar = adrDollarSum / adrPeriod;
+
+      if (current.adrDollar > 0 && current.avgVol > 0) {
+        current.rVol = current.volume / current.avgVol;
+        
+        // NEW MATH: (High - Open) / (ADR in dollar value)
+        current.maxExcursionAdr = current.openToHighRange / current.adrDollar;
+        current.dateStr = current.date.toISOString().split('T')[0];
+        current.rvolPeriod = rvolPeriod;
+        current.adrPeriod = adrPeriod;
+        
+        // Filter out absolute anomalies for cleaner regression/charting
+        if (current.rVol < 25 && current.maxExcursionAdr < 15) {
+           result.push(current);
+        }
+      }
+    }
+  }
+  return result;
+};
+
+// --- MAIN COMPONENT ---
+export default function App() {
+  const [rawMarketData, setRawMarketData] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [availableTickers, setAvailableTickers] = useState(INITIAL_TICKERS);
+  const [searchInput, setSearchInput] = useState('');
+  const [selectedTickerFilter, setSelectedTickerFilter] = useState('ALL');
+  const [rvolPeriod, setRvolPeriod] = useState(20);
+  const [adrPeriod, setAdrPeriod] = useState(20);
+
+  // Initial Load
+  useEffect(() => {
+    loadInitialData();
+  }, []);
+
+  const loadInitialData = async () => {
+    setLoading(true);
+    const newRawData = {};
+    
+    for (const ticker of INITIAL_TICKERS) {
+      newRawData[ticker] = await fetchRawTickerData(ticker);
+    }
+    
+    setRawMarketData(newRawData);
+    setLoading(false);
+  };
+
+  // The Fetch wrapper: Attempts to hit backend, falls back to simulator if offline/in-browser
+  const fetchRawTickerData = async (ticker) => {
+    let rawData;
+    try {
+      // Intended backend integration point for your node.js server
+      const response = await fetch(`/api/yahoo-finance2?ticker=${ticker}`);
+      if (!response.ok) throw new Error("Backend not available");
+      rawData = await response.json();
+      // Ensure date strings are mapped back to Date objects if coming from JSON
+      rawData = rawData.map(d => ({...d, date: new Date(d.date)}));
+    } catch (e) {
+      // Fallback for Canvas/Browser preview without a backend
+      console.log(`Backend fetch failed for ${ticker}, utilizing realistic data simulator.`);
+      rawData = generateMockData(ticker);
+    }
+    return rawData;
+  };
+
+  const handleAddCustomTicker = async (e) => {
+    e.preventDefault();
+    const symbol = searchInput.trim().toUpperCase();
+    if (!symbol) return;
+
+    if (availableTickers.includes(symbol)) {
+      setSelectedTickerFilter(symbol);
+      setSearchInput('');
+      return;
+    }
+
+    setLoading(true);
+    const rawData = await fetchRawTickerData(symbol);
+    
+    setAvailableTickers(prev => [...prev, symbol]);
+    setRawMarketData(prev => ({ ...prev, [symbol]: rawData }));
+    setSelectedTickerFilter(symbol);
+    setSearchInput('');
+    setLoading(false);
+  };
+
+  // Process data when raw data or periods change
+  const processedData = useMemo(() => {
+    let allProcessed = [];
+    for (const [ticker, rawData] of Object.entries(rawMarketData)) {
+      allProcessed = allProcessed.concat(processTickerData(rawData, ticker, rvolPeriod, adrPeriod));
+    }
+    return allProcessed;
+  }, [rawMarketData, rvolPeriod, adrPeriod]);
+
+  // Filter and sort data for Recharts (Sorting by X axis is crucial for Line charts)
+  const chartData = useMemo(() => {
+    const filtered = selectedTickerFilter === 'ALL' 
+      ? processedData 
+      : processedData.filter(d => d.ticker === selectedTickerFilter);
+      
+    // Calculate Regression
+    const regression = calculateRegression(filtered);
+    
+    // Sort ascending by RVol and attach the regression Y value so the Line renders smoothly
+    return filtered
+      .sort((a, b) => a.rVol - b.rVol)
+      .map(point => ({
+        ...point,
+        regressionY: regression ? (regression.slope * point.rVol + regression.intercept) : null,
+        equation: regression?.equation
+      }));
+  }, [processedData, selectedTickerFilter]);
+
+  // Generate Statistical Summary Table Data
+  const summaryStats = useMemo(() => {
+    return BINS.map(bin => {
+      const bucketData = chartData.filter(d => d.rVol >= bin.min && d.rVol < bin.max);
+      const excursions = bucketData.map(d => d.maxExcursionAdr);
+
+      return {
+        label: bin.label,
+        sampleSize: bucketData.length,
+        medianExcursion: getMedian(excursions)?.toFixed(2),
+        meanExcursion: getMean(excursions)?.toFixed(2),
+        maxExcursion: excursions.length ? Math.max(...excursions).toFixed(2) : undefined
+      };
+    });
+  }, [chartData]);
+
+  // Extract the regression equation for UI display
+  const regressionEquation = chartData.length > 0 && chartData[0].equation ? chartData[0].equation : null;
+
+  // Custom Tooltip for Chart
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      // Find the scatter payload (it contains all custom data)
+      const scatterPayload = payload.find(p => p.dataKey === 'maxExcursionAdr')?.payload;
+      if (!scatterPayload) return null;
+
+      return (
+        <div className="bg-white p-4 border border-slate-200 shadow-lg rounded-md text-sm">
+          <p className="font-bold text-slate-800 border-b pb-2 mb-2">{scatterPayload.ticker} - {scatterPayload.dateStr}</p>
+          <p className="text-slate-600">RVol: <span className="font-semibold text-slate-900">{scatterPayload.rVol.toFixed(2)}x</span></p>
+          <p className="text-slate-600">Max Excursion (High-Open): <span className="font-semibold text-slate-900">{scatterPayload.maxExcursionAdr.toFixed(2)}x ADR</span></p>
+          <p className="text-slate-500 text-xs mt-2">Open-to-High Range: ${(scatterPayload.openToHighRange).toFixed(2)}</p>
+          <p className="text-slate-500 text-xs">{scatterPayload.adrPeriod}-Day ADR: ${(scatterPayload.adrDollar).toFixed(2)}</p>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-slate-50">
+        <div className="text-lg font-semibold text-slate-600 animate-pulse text-center">
+          <p>Processing Market Data...</p>
+          <p className="text-sm font-normal text-slate-400 mt-2">Fetching history and calculating mathematical relationships</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 md:p-8 font-sans text-slate-800">
+      <div className="max-w-6xl mx-auto space-y-6">
+        
+        {/* Header & Controls */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900">Intraday Excursion vs Volume Dashboard</h1>
+            <p className="text-sm text-slate-500 mt-1">
+              Analyzing `(High - Open) / ADR$` mathematically regressed against RVol.
+            </p>
+          </div>
+          
+          <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 bg-slate-100 p-4 rounded-lg">
+            <form onSubmit={handleAddCustomTicker} className="flex flex-col sm:flex-row items-center gap-3 w-full lg:w-auto">
+              <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">Analyze Ticker:</label>
+              <div className="flex w-full sm:w-auto">
+                <input 
+                  type="text"
+                  list="ticker-list"
+                  value={searchInput}
+                  onChange={e => setSearchInput(e.target.value)}
+                  placeholder="e.g. NVDA"
+                  className="bg-white border border-slate-300 text-slate-900 text-sm rounded-l-md focus:ring-blue-500 focus:border-blue-500 block w-full p-2 outline-none uppercase"
+                />
+                <datalist id="ticker-list">
+                  <option value="ALL">ALL TICKERS</option>
+                  {availableTickers.map(t => <option key={t} value={t} />)}
+                </datalist>
+                <button 
+                  type="submit"
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-r-md transition-colors text-sm"
+                >
+                  Fetch
+                </button>
+              </div>
+              <select 
+                value={selectedTickerFilter} 
+                onChange={e => setSelectedTickerFilter(e.target.value)}
+                className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md focus:ring-blue-500 focus:border-blue-500 p-2 cursor-pointer outline-none w-full sm:w-auto"
+              >
+                <option value="ALL">View All Data</option>
+                {availableTickers.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </form>
+
+            <div className="flex flex-col sm:flex-row items-center gap-4 w-full lg:w-auto border-t lg:border-t-0 lg:border-l border-slate-300 pt-4 lg:pt-0 lg:pl-4">
+               <div className="flex items-center space-x-2">
+                 <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">RVol Period:</label>
+                 <select 
+                   value={rvolPeriod} 
+                   onChange={e => setRvolPeriod(Number(e.target.value))}
+                   className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
+                 >
+                   <option value={10}>10 Days</option>
+                   <option value={20}>20 Days</option>
+                   <option value={50}>50 Days</option>
+                 </select>
+               </div>
+               
+               <div className="flex items-center space-x-2">
+                 <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">ADR Period:</label>
+                 <select 
+                   value={adrPeriod} 
+                   onChange={e => setAdrPeriod(Number(e.target.value))}
+                   className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
+                 >
+                   <option value={10}>10 Days</option>
+                   <option value={20}>20 Days</option>
+                   <option value={50}>50 Days</option>
+                 </select>
+               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Chart Visualization */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+          <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-end">
+            <div>
+              <h2 className="text-lg font-bold text-slate-800">Scatter Plot with Linear Regression</h2>
+              <p className="text-xs text-slate-500">Y-Axis: Max Intraday Excursion Multiple. X-Axis: Relative Volume.</p>
+            </div>
+            {regressionEquation && (
+              <div className="mt-2 sm:mt-0 bg-blue-50 border border-blue-200 text-blue-800 text-xs font-mono px-3 py-1 rounded-full font-semibold">
+                Relationship: {regressionEquation}
+              </div>
+            )}
+          </div>
+          
+          <div className="h-[400px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={chartData} margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis 
+                  type="number" 
+                  dataKey="rVol" 
+                  name="RVol" 
+                  domain={[0, 'auto']} 
+                  label={{ value: 'Relative Volume (RVol)', position: 'bottom', offset: 0, style: { fill: '#64748b', fontSize: 12 } }} 
+                  tick={{ fill: '#64748b', fontSize: 12 }}
+                  tickFormatter={(val) => `${val}x`}
+                />
+                <YAxis 
+                  type="number" 
+                  dataKey="maxExcursionAdr" 
+                  name="Max Excursion" 
+                  domain={[0, 'auto']} 
+                  label={{ value: 'Intraday Excursion (High-Open) / ADR$', angle: -90, position: 'insideLeft', style: { fill: '#64748b', fontSize: 12 } }} 
+                  tick={{ fill: '#64748b', fontSize: 12 }}
+                  tickFormatter={(val) => `${val}x`}
+                />
+                <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: '3 3', stroke: '#cbd5e1' }} />
+                
+                {/* The Scatter Dots */}
+                <Scatter dataKey="maxExcursionAdr" fill="#3b82f6" fillOpacity={0.6} stroke="#2563eb" strokeWidth={1} />
+                
+                {/* The Linear Regression Trendline */}
+                <Line 
+                  dataKey="regressionY" 
+                  stroke="#ef4444" 
+                  strokeWidth={2} 
+                  dot={false} 
+                  activeDot={false}
+                  tooltipType="none" // hide from tooltip
+                  name="Trendline"
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Statistical Summary Table */}
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div className="p-6 border-b border-slate-200">
+             <h2 className="text-lg font-bold text-slate-800">Intraday Excursion by RVol Bucket</h2>
+             <p className="text-xs text-slate-500">Grouped analysis showing the mathematical expansion from the day's open to high.</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left text-slate-600">
+              <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th scope="col" className="px-6 py-4 font-bold">RVol Bucket</th>
+                  <th scope="col" className="px-6 py-4 text-center">Sample Size</th>
+                  <th scope="col" className="px-6 py-4 text-right">Median Max Excursion</th>
+                  <th scope="col" className="px-6 py-4 text-right">Mean Max Excursion</th>
+                  <th scope="col" className="px-6 py-4 text-right font-bold text-slate-800">Absolute Max Excursion</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summaryStats.map((row, idx) => (
+                  <tr key={idx} className="bg-white border-b hover:bg-slate-50 transition-colors">
+                    <td className="px-6 py-4 font-semibold text-slate-900 whitespace-nowrap">
+                      {row.label}
+                    </td>
+                    <td className="px-6 py-4 text-center">
+                      <span className="bg-slate-100 text-slate-700 py-1 px-3 rounded-full text-xs font-medium">
+                        {row.sampleSize}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-right font-medium">{row.medianExcursion ? `${row.medianExcursion}x` : '-'}</td>
+                    <td className="px-6 py-4 text-right">{row.meanExcursion ? `${row.meanExcursion}x` : '-'}</td>
+                    <td className="px-6 py-4 text-right text-red-600 font-bold">{row.maxExcursion ? `${row.maxExcursion}x` : '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
