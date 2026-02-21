@@ -4,7 +4,7 @@ import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
 
 // --- CONFIGURATION ---
-const INITIAL_TICKERS = ['QQQ', 'VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC'];
+const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC'];
 
 const BINS = [
   { label: '< 0.5x', min: 0, max: 0.5 },
@@ -170,6 +170,8 @@ const processTickerData = (data, ticker, rvolPeriod, adrPeriod) => {
   return result;
 };
 
+
+
 // --- MAIN COMPONENT ---
 export default function App() {
   const [rawMarketData, setRawMarketData] = useState({});
@@ -179,6 +181,7 @@ export default function App() {
   const [selectedTickerFilter, setSelectedTickerFilter] = useState(INITIAL_TICKERS[0]);
   const [rvolPeriod, setRvolPeriod] = useState(50);
   const [adrPeriod, setAdrPeriod] = useState(20);
+  const [customRvolThreshold, setCustomRvolThreshold] = useState('1.5');
 
   // Initial Load
   useEffect(() => {
@@ -348,6 +351,31 @@ export default function App() {
       };
     });
   }, [chartData]);
+
+  const customStat = useMemo(() => {
+    const threshold = parseFloat(customRvolThreshold);
+    const totalDataPoints = chartData.length;
+    if (isNaN(threshold) || totalDataPoints === 0) return null;
+
+    const daysMeetingRvol = chartData.filter(d => d.rVol >= threshold);
+    const denominator = daysMeetingRvol.length;
+
+    const daysMeetingBoth = daysMeetingRvol.filter(d => d.maxExcursionAdr >= 1.5);
+    const numerator = daysMeetingBoth.length;
+
+    const probability = denominator > 0 ? (numerator / denominator) * 100 : 0;
+    const overallFrequency = (numerator / totalDataPoints) * 100;
+    const avgExcursion = denominator > 0 ? daysMeetingRvol.reduce((sum, d) => sum + d.maxExcursionAdr, 0) / denominator : 0;
+
+    return {
+      threshold: customRvolThreshold,
+      totalMatchingDays: denominator,
+      highExcursionDays: numerator,
+      probability: probability.toFixed(2),
+      overallFrequency: overallFrequency.toFixed(2),
+      avgExcursion: avgExcursion.toFixed(2),
+    };
+  }, [chartData, customRvolThreshold]);
 
   // Calculate RVol Distribution for Bell Curve
   const { rvolDistributionData, rvolStats } = useMemo(() => {
@@ -971,9 +999,22 @@ export default function App() {
         {/* Advanced Statistical Analysis: High Excursion Probabilities */}
         {advancedStats.length > 0 && (
           <div className="bg-white border border-slate-200 rounded-xl shadow-sm mt-6 overflow-hidden">
-            <div className="bg-slate-50 border-b border-slate-200 p-4">
-              <h3 className="text-md font-bold text-slate-800">Advanced High-Excursion Probabilities</h3>
-              <p className="text-xs text-slate-500 mt-1">Historically analyzing the percentage of days that push a <strong>High Excursion (&ge; 1.5 ADR)</strong> once an RVol threshold is breached.</p>
+            <div className="bg-slate-50 border-b border-slate-200 p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+              <div>
+                <h3 className="text-md font-bold text-slate-800">Advanced High-Excursion Probabilities</h3>
+                <p className="text-xs text-slate-500 mt-1">Historically analyzing the percentage of days that push a <strong>High Excursion (&ge; 1.5 ADR)</strong> once an RVol threshold is breached.</p>
+              </div>
+              <div className="bg-white border border-green-200 rounded-lg shadow-sm p-3 flex items-center space-x-3 whitespace-nowrap">
+                <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center flex-shrink-0">
+                  <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                </div>
+                <div>
+                  <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Total Data in Green Zone</div>
+                  <div className="text-xl font-bold text-green-700">
+                    {advancedStats.find(s => s.threshold === '1.5')?.overallFrequency || '0.00'}%
+                  </div>
+                </div>
+              </div>
             </div>
             <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               {advancedStats.map((stat, idx) => (
@@ -987,7 +1028,7 @@ export default function App() {
 
                   <div className="mt-4">
                     <div className="flex justify-between items-end mb-1">
-                      <span className="text-sm font-medium text-slate-700">Win Rate:</span>
+                      <span className="text-sm font-medium text-slate-700">Green Zone Rate:</span>
                       <span className="text-xl font-bold text-green-600">{stat.probability}%</span>
                     </div>
                     <div className="w-full bg-slate-200 rounded-full h-1.5 mb-3">
@@ -1013,6 +1054,63 @@ export default function App() {
                   </div>
                 </div>
               ))}
+            </div>
+
+            {/* Custom RVol Input Block */}
+            <div className="bg-blue-50/50 border-t border-slate-200 p-4 sm:p-6">
+              <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center justify-between">
+                <div className="flex-1">
+                  <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                    <svg className="w-5 h-5 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
+                    Custom RVol Green Zone Calculator
+                  </h4>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Enter a specific minimum Relative Volume (RVol) across your datasets to calculate its historical probability of reaching a <span className="font-semibold text-green-700">1.5x+ ADR</span> Excursion.
+                  </p>
+                </div>
+
+                <div className="flex items-stretch bg-white border border-blue-200 shadow-sm rounded-lg overflow-hidden w-full lg:w-auto">
+                  <div className="px-4 py-3 bg-slate-50 border-r border-blue-100 flex items-center justify-center">
+                    <span className="text-xs font-bold text-slate-500 tracking-wider">RVOL &ge;</span>
+                  </div>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    placeholder="e.g. 1.5"
+                    className="w-24 px-3 py-2 outline-none text-slate-800 font-bold focus:bg-blue-50 transition-colors"
+                    value={customRvolThreshold}
+                    onChange={(e) => setCustomRvolThreshold(e.target.value)}
+                  />
+                  <div className="flex-1 px-4 py-3 bg-blue-600 text-white flex items-center justify-between gap-4 min-w-[140px]">
+                    <div className="flex flex-col">
+                      <span className="text-[10px] uppercase font-semibold text-blue-200 tracking-wider leading-none mb-1">Green Zone Rate</span>
+                      <span className="text-2xl font-bold leading-none">{customStat ? customStat.probability : '0.00'}%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {customStat && !isNaN(parseFloat(customRvolThreshold)) && (
+                <div className="mt-4 pt-4 border-t border-blue-200/50 flex flex-wrap gap-x-6 gap-y-2 text-xs">
+                  <div className="flex flex-col">
+                    <span className="text-slate-500">Total Signal Days</span>
+                    <span className="font-semibold text-slate-800">{customStat.totalMatchingDays}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-slate-500">High Excursion Hits</span>
+                    <span className="font-semibold text-green-700">{customStat.highExcursionDays}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-slate-500">Avg. Group Excursion</span>
+                    <span className="font-semibold text-blue-700">{customStat.avgExcursion}x</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-slate-500">Overall Frequency</span>
+                    <span className="font-semibold text-slate-800">{customStat.overallFrequency}%</span>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}        {/* Selected Ticker Stock Chart */}
