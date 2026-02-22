@@ -40,44 +40,7 @@ const getNormalDistribution = (x, mean, stdDev) => {
   return factor * Math.exp(exponent);
 };
 
-// --- DATA SIMULATION & PROCESSING ---
-// Simulates 1 year of realistic daily stock data as a fallback
-const generateMockData = (ticker) => {
-  const data = [];
-  let currentPrice = 20 + Math.random() * 80;
-  let baseVolume = 1000000 + Math.random() * 5000000;
-  const now = new Date();
-
-  for (let i = 400; i >= 0; i--) {
-    const date = new Date(now);
-    date.setDate(date.getDate() - i);
-
-    if (date.getDay() === 0 || date.getDay() === 6) continue;
-
-    const normalVolatility = 0.03;
-    let changePct = (Math.random() - 0.5) * normalVolatility * 2;
-    let volume = baseVolume * (0.6 + Math.random() * 0.8);
-
-    const isCatalyst = Math.random() > 0.92;
-    if (isCatalyst) {
-      volume *= (2 + Math.random() * 4);
-      changePct = (Math.random() - 0.5) * normalVolatility * 8;
-    }
-
-    const open = currentPrice;
-    const close = open * (1 + changePct);
-
-    const maxOC = Math.max(open, close);
-    const minOC = Math.min(open, close);
-    const high = maxOC * (1 + Math.random() * 0.015);
-    const low = minOC * (1 - Math.random() * 0.015);
-
-    data.push({ date, open, high, low, close, volume });
-    currentPrice = close;
-  }
-  return data;
-};
-
+// --- DATA PROCESSING ---
 // Applies the specific Abs Max Excursion from open / ADR Dollar Math
 const processTickerData = (data, ticker, rvolPeriod, adrPeriod) => {
   const result = [];
@@ -184,21 +147,21 @@ export default function App() {
 
 
 
-  // The Fetch wrapper: Attempts to hit backend, falls back to simulator if offline/in-browser
+  // The Fetch wrapper: Hits backend directly, throws error if backend fails
   const fetchRawTickerData = async (ticker) => {
-    let rawData;
     try {
       // Backend integration point
       const response = await fetch(`/api/yahoo-finance2?ticker=${ticker}`);
       if (!response.ok) throw new Error("Backend not available");
-      rawData = await response.json();
+      let rawData = await response.json();
       rawData = rawData.map(d => ({ ...d, date: new Date(d.date) }));
-    } catch {
-      // Fallback for missing backend
-      console.log(`Backend fetch failed for ${ticker}, utilizing realistic data simulator.`);
-      rawData = generateMockData(ticker);
+      return rawData;
+    } catch (err) {
+      console.error(`Backend fetch failed for ${ticker}. Ensure the backend server is running.`);
+      // Return empty array to prevent app crash, 
+      // but do NOT fallback to generated mock data.
+      return [];
     }
-    return rawData;
   };
 
   const handleAddCustomTicker = async (e) => {

@@ -215,7 +215,7 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
         lstmPredictedExc: denormPreds[idx]
     }));
 
-    // Auto-save the freshly trained model to IndexedDB
+    // Auto-save the freshly trained model to IndexedDB AND the Project Folder automatically!
     await saveModelToStorage(model, prepared);
 
     return {
@@ -287,15 +287,55 @@ export const evaluateLstmOnData = async (model, preparedDataMeta, tickerData) =>
 
 /**
  * Saves a trained model and its normalization metadata to the browser's IndexedDB.
- * This completely eliminates the need to train every time the app loads.
+ * AND sends it to the backend server to save it permanently in public/models/
  */
 export const saveModelToStorage = async (model, preparedData) => {
     try {
+        // 1. Save locally to browser IndexedDB
         await model.save('indexeddb://stock-lstm-model');
         localStorage.setItem('stock-lstm-meta', JSON.stringify(preparedData));
+
+        // 2. Fetch the newly saved model from IndexedDB as a Blob so we can send it to our backend
+        // (TensorFlow.js doesn't easily return binary buffers directly from model.save('localstorage'), 
+        //  but we can use model.save(tf.io.withSaveHandler(...)) for a custom route to backend)
+        await model.save(tf.io.withSaveHandler(async (artifacts) => {
+            const formData = new FormData();
+
+            // Appends model.json
+            const modelTopologyAndWeightManifest = {
+                modelTopology: artifacts.modelTopology,
+                format: artifacts.format,
+                generatedBy: artifacts.generatedBy,
+                convertedBy: artifacts.convertedBy,
+                weightsManifest: artifacts.weightsManifest
+            };
+            const jsonBlob = new Blob([JSON.stringify(modelTopologyAndWeightManifest)], { type: 'application/json' });
+            formData.append('modelJson', jsonBlob, 'stock-lstm-model.json');
+
+            // Appends model.weights.bin
+            const weightData = artifacts.weightData;
+            const weightBlob = new Blob([weightData], { type: 'application/octet-stream' });
+            formData.append('modelWeights', weightBlob, 'stock-lstm-model.weights.bin');
+
+            // Appends metadata
+            formData.append('metadata', JSON.stringify(preparedData, null, 2));
+
+            // POST to backend securely
+            const response = await fetch('/api/save-model', {
+                method: 'POST',
+                body: formData
+            });
+            if (!response.ok) {
+                console.error("Backend failed to save the model project files.");
+            } else {
+                console.log("Model successfully backed up inside the project folder: public/models/");
+            }
+            return { modelArtifactsInfo: { dateSaved: new Date(), modelTopologyBytes: jsonBlob.size, weightDataBytes: weightBlob.size } };
+        }));
+
         return true;
     } catch (e) {
-        console.error("Failed to save to indexeddb", e);
+        console.error("Failed to save model to indexeddb or backend", e);
         return false;
     }
 };
