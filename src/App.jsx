@@ -6,7 +6,7 @@ import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadMode
 import { findBestFitRegression } from './utils/mathUtils';
 
 // --- CONFIGURATION ---
-const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC'];
+const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC', 'COHR', 'FIX', 'AU', 'VSCO', 'WPM'];
 
 const BINS = [
   { label: '< 0.5x', min: 0, max: 0.5 },
@@ -205,7 +205,7 @@ export default function App() {
 
     // Calculate Best Fit Regression
     const points = sortedChartData.map(d => ({ x: d.rVol, y: d.maxExcursionAdr }));
-    const regression = findBestFitRegression(points);
+    const regression = findBestFitRegression(points, 4);
 
     return { chartData: sortedChartData, historicalRegression: regression };
   }, [processedData, selectedTickerFilter]);
