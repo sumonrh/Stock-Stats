@@ -205,7 +205,7 @@ export default function App() {
 
     // Calculate Best Fit Regression
     const points = sortedChartData.map(d => ({ x: d.rVol, y: d.maxExcursionAdr }));
-    const regression = findBestFitRegression(points, 4);
+    const regression = findBestFitRegression(points, 4, 2, false);
 
     return { chartData: sortedChartData, historicalRegression: regression };
   }, [processedData, selectedTickerFilter]);

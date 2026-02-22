@@ -233,29 +233,31 @@ const calcPolynomial = (data, order) => {
  * @param {Array} points - Array of {x, y}
  * @param {number} maxPolyOrder - The maximum polynomial order to test up to (default 2)
  */
-export const findBestFitRegression = (points, maxPolyOrder = 2) => {
+export const findBestFitRegression = (points, maxPolyOrder = 2, minPolyOrder = 1, includeExponential = true) => {
     if (!points || points.length < 3) return null;
 
     // Filter valid numeric points
     const data = points.filter(p => p.x != null && p.y != null && isFinite(p.x) && isFinite(p.y));
     if (data.length < 3) return null;
 
-    const exp = calcExponential(data);
+    let best = null;
 
-    let best = exp;
+    if (includeExponential) {
+        best = calcExponential(data);
+    }
 
-    // Test polynomial models from order 1 (linear) up to maxPolyOrder
-    for (let order = 1; order <= maxPolyOrder; order++) {
+    // Test polynomial models from minPolyOrder up to maxPolyOrder
+    for (let order = minPolyOrder; order <= maxPolyOrder; order++) {
         // Or if order is 1 we can just use calcPolynomial(data, 1) and that acts as linear
         const poly = calcPolynomial(data, order);
-        if (poly && poly.r2 > best.r2) {
+        if (!best || (poly && poly.r2 > best.r2)) {
             best = poly;
         }
     }
 
     // Default to a model even if r2 is negative (e.g. completely linear flat)
-    if (best.r2 === -1) {
-        return calcPolynomial(data, 1);
+    if (!best || best.r2 === -1) {
+        return calcPolynomial(data, minPolyOrder);
     }
 
     return best;
