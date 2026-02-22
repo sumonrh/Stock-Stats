@@ -215,6 +215,9 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
         lstmPredictedExc: denormPreds[idx]
     }));
 
+    // Auto-save the freshly trained model to IndexedDB
+    await saveModelToStorage(model, prepared);
+
     return {
         mse,
         predictionsMap,
@@ -222,5 +225,145 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
         model, // return it in case we optionally want to run inference elsewhere
         preparedData: prepared // return min max boundaries for future manual inference mapping
     };
+};
+
+/**
+ * Runs inference only using an already trained model on newly fetched/processed data.
+ */
+export const evaluateLstmOnData = async (model, preparedDataMeta, tickerData) => {
+    // We recreate the prepared sequences but we MUST use the originally trained min/max 
+    // to normalize the new data exactly the way the model expects.
+    if (!tickerData || tickerData.length <= SEQ_LENGTH) return null;
+
+    const sorted = [...tickerData].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const rawRVols = sorted.map(d => d.rVol);
+    const rawExcursions = sorted.map(d => d.maxExcursionAdr);
+
+    // Normalize using existing meta boundaries!
+    const normRVols = rawRVols.map(v => (v - preparedDataMeta.rvolMin) / (preparedDataMeta.rvolMax - preparedDataMeta.rvolMin));
+    const normExcursions = rawExcursions.map(v => (v - preparedDataMeta.excMin) / (preparedDataMeta.excMax - preparedDataMeta.excMin));
+
+    const inputs = [];
+    for (let i = SEQ_LENGTH; i < sorted.length; i++) {
+        const sequence = [];
+        for (let j = i - SEQ_LENGTH; j < i; j++) {
+            sequence.push([normRVols[j], normExcursions[j]]);
+        }
+        const seqWithToday = sequence.map((step, idx) => {
+            if (idx === SEQ_LENGTH - 1) return [step[0], step[1], normRVols[i]];
+            return [step[0], step[1], 0];
+        });
+        inputs.push(seqWithToday);
+    }
+
+    // Also update lastSequence
+    preparedDataMeta.lastSequence = inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1]]) : preparedDataMeta.lastSequence;
+
+    const xs = tf.tensor3d(inputs);
+    const predsTensor = model.predict(xs);
+    const predsArray = await predsTensor.data();
+
+    const denormPreds = Array.from(predsArray).map(v => denormalizeValue(v, preparedDataMeta.excMin, preparedDataMeta.excMax));
+
+    xs.dispose();
+    predsTensor.dispose();
+
+    // Map predictions to the slice of points that were passed (offset by SEQ_LENGTH)
+    const validPoints = sorted.slice(SEQ_LENGTH);
+    const predictionsMap = validPoints.map((pt, idx) => ({
+        ...pt,
+        lstmPredictedExc: denormPreds[idx] || 0
+    }));
+
+    // If finalLoss is missing since it wasn't just trained, we can mock it
+    return {
+        mse: 0,
+        predictionsMap,
+        finalLoss: 0,
+        model,
+        preparedData: preparedDataMeta
+    };
+};
+
+/**
+ * Saves a trained model and its normalization metadata to the browser's IndexedDB.
+ * This completely eliminates the need to train every time the app loads.
+ */
+export const saveModelToStorage = async (model, preparedData) => {
+    try {
+        await model.save('indexeddb://stock-lstm-model');
+        localStorage.setItem('stock-lstm-meta', JSON.stringify(preparedData));
+        return true;
+    } catch (e) {
+        console.error("Failed to save to indexeddb", e);
+        return false;
+    }
+};
+
+/**
+ * Attempts to load the existing saved model from IndexedDB.
+ */
+export const loadModelFromStorage = async () => {
+    try {
+        const metaStr = localStorage.getItem('stock-lstm-meta');
+        if (!metaStr) return null;
+
+        const preparedData = JSON.parse(metaStr);
+        // Ensure tf is fully loaded before doing this
+        const model = await tf.loadLayersModel('indexeddb://stock-lstm-model');
+        return { model, preparedData };
+    } catch (e) {
+        console.warn("No valid model found in indexeddb, training will be required.");
+        return null;
+    }
+};
+
+/**
+ * Downloads the model's weights & biases (model.json + .bin) and its metadata (JSON)
+ * directly to the user's hard drive so they can be ported to other apps.
+ */
+export const downloadModelFiles = async (model, preparedData) => {
+    try {
+        await model.save('downloads://stock-lstm-model');
+
+        // Also trigger download of metadata json
+        const metadataStr = JSON.stringify(preparedData, null, 2);
+        const blob = new Blob([metadataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'stock-lstm-meta.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch (e) {
+        console.error("Error downloading model files", e);
+    }
+};
+
+/**
+ * Loads the model directly from manually uploaded local files.
+ * Expects exactly: model.json, weights.bin, and stock-lstm-meta.json
+ */
+export const loadModelFromFiles = async (modelFile, weightsFile, metaFile) => {
+    try {
+        const metaText = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = e => resolve(e.target.result);
+            reader.onerror = e => reject(e);
+            reader.readAsText(metaFile);
+        });
+        const preparedData = JSON.parse(metaText);
+        const model = await tf.loadLayersModel(tf.io.browserFiles([modelFile, weightsFile]));
+
+        // After loading a custom file, let's cache it globally to IndexedDB
+        await saveModelToStorage(model, preparedData);
+
+        return { model, preparedData };
+    } catch (e) {
+        console.error("Error loading model from files", e);
+        throw e;
+    }
 };
 

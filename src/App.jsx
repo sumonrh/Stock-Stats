@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ComposedChart, Scatter, Line, Bar, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, Legend } from 'recharts';
 import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
-import { runTfjsPipeline } from './utils/tfjsEngine';
+import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadModelFiles, evaluateLstmOnData } from './utils/tfjsEngine';
 import { findBestFitRegression } from './utils/mathUtils';
 
 // --- CONFIGURATION ---
@@ -165,7 +165,24 @@ export default function App() {
 
     setRawMarketData(newRawData);
     setLoading(false);
+
+    // Auto-load model from IndexedDB on startup
+    const cached = await loadModelFromStorage();
+    if (cached) {
+      // Create empty/mock result just to show it's loaded, 
+      // or evaluate it immediately if we had processed data.
+      // Easiest is to set a "pending" evaluation:
+      setAiResults({
+        ...cached,
+        finalLoss: 0,
+        predictionsMap: [],
+        mse: 0
+      });
+      // A dedicated effect below will spot this and re-evaluate the predictions!
+    }
   };
+
+
 
   // The Fetch wrapper: Attempts to hit backend, falls back to simulator if offline/in-browser
   const fetchRawTickerData = async (ticker) => {
@@ -230,6 +247,24 @@ export default function App() {
     return { chartData: sortedChartData, historicalRegression: regression };
   }, [processedData, selectedTickerFilter]);
 
+  // Whenever chartData changes, if we have a loaded model, re-evaluate the current filtered data so predictions map properly
+  useEffect(() => {
+    if (aiResults?.model && aiResults?.preparedData && chartData?.length > 10) {
+      const evaluate = async () => {
+        // Prevent infinite loops by only re-evaluating if predictionsMap length doesn't match chartData length (rough heuristic)
+        // Or better, just only auto-evaluate if the user changes the ticker/periods.
+        // Actually, just calling evaluateLstmOnData is very fast (no training).
+        const result = await evaluateLstmOnData(aiResults.model, aiResults.preparedData, chartData);
+        if (result && result.predictionsMap && result.predictionsMap.length !== aiResults.predictionsMap?.length) {
+          setAiResults(result);
+        }
+      };
+      evaluate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartData]);
+
+
   // AI Regression Tracker
   const aiRegression = useMemo(() => {
     if (!aiResults || !aiResults.predictionsMap || aiResults.predictionsMap.length < 3) return null;
@@ -283,6 +318,50 @@ export default function App() {
       console.error("AI Training Error", err);
     }
     setIsTrainingAi(false);
+  };
+
+  const handleDownloadModel = async () => {
+    if (!aiResults || !aiResults.model || !aiResults.preparedData) return;
+    await downloadModelFiles(aiResults.model, aiResults.preparedData);
+  };
+
+  const handleUploadModel = async (e) => {
+    const files = e.target.files;
+    if (files.length !== 3) {
+      alert("Please select exactly 3 files: model.json, weights.bin, and stock-lstm-meta.json");
+      return;
+    }
+
+    let modelFile = null;
+    let weightsFile = null;
+    let metaFile = null;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.name.endsWith('json') && file.name.includes('meta')) metaFile = file;
+      else if (file.name.endsWith('json') && file.name.includes('model')) modelFile = file;
+      else if (file.name.endsWith('bin')) weightsFile = file;
+    }
+
+    if (!modelFile || !weightsFile || !metaFile) {
+      alert("Missing one of the required files. Make sure to select model.json, weights.bin, AND stock-lstm-meta.json correctly.");
+      return;
+    }
+
+    try {
+      const result = await loadModelFromFiles(modelFile, weightsFile, metaFile);
+      if (result) {
+        // Re-eval on current data
+        const evaluation = await evaluateLstmOnData(result.model, result.preparedData, chartData);
+        setAiResults(evaluation || {
+          ...result, finalLoss: 0, mse: 0, predictionsMap: []
+        });
+        alert("Model successfully loaded and applied!");
+      }
+    } catch (err) {
+      console.error("Failed to load custom files:", err);
+      alert("Failed to load model from the provided files.");
+    }
   };
 
   const handleManualPrediction = async () => {
@@ -1017,15 +1096,34 @@ export default function App() {
           <div className="flex justify-between items-center">
             <div>
               <h2 className="text-lg font-bold text-slate-800">Neural Network Predictor (LSTM)</h2>
-              <p className="text-xs text-slate-500">Train an AI model directly in your browser to predict Excursion based on sequence history.</p>
+              <p className="text-xs text-slate-500">Train an AI model directly in your browser to predict Excursion based on sequence history. Saves locally to accelerate future reloads.</p>
             </div>
-            <button
-              onClick={handleTrainAI}
-              disabled={isTrainingAi || chartData.length < 10}
-              className={`py-2 px-6 rounded-md font-semibold text-white transition-colors ${isTrainingAi ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
-            >
-              {isTrainingAi ? `Training... Epoch ${aiTrainingEpoch}/${aiTotalEpochs}` : 'Train AI Predictor'}
-            </button>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                onClick={handleTrainAI}
+                disabled={isTrainingAi || chartData.length < 10}
+                className={`py-2 px-4 rounded-md font-semibold text-white transition-colors text-sm ${isTrainingAi ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
+              >
+                {isTrainingAi ? `Training... Epoch ${aiTrainingEpoch}/${aiTotalEpochs}` : 'Train AI'}
+              </button>
+              {aiResults && !isTrainingAi && (
+                <button
+                  onClick={handleDownloadModel}
+                  className="py-2 px-4 rounded-md font-semibold text-purple-700 bg-purple-100 hover:bg-purple-200 transition-colors text-sm border border-purple-300"
+                  title="Export Model to PC"
+                >
+                  Export Model
+                </button>
+              )}
+
+              <div className="relative">
+                <label className="py-2 px-4 rounded-md font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors text-sm border border-slate-300 cursor-pointer block text-center" title="Import previously downloaded model files">
+                  Import
+                  <input type="file" multiple accept=".json,.bin" className="hidden" onChange={handleUploadModel} />
+                </label>
+              </div>
+            </div>
           </div>
 
           {isTrainingAi && (
