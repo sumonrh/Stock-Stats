@@ -2,6 +2,8 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ComposedChart, Scatter, Line, Bar, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, Legend } from 'recharts';
 import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
+import { runTfjsPipeline } from './utils/tfjsEngine';
+import { findBestFitRegression } from './utils/mathUtils';
 
 // --- CONFIGURATION ---
 const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC'];
@@ -36,53 +38,6 @@ const getNormalDistribution = (x, mean, stdDev) => {
   const factor = 1 / Math.sqrt(2 * Math.PI * variance);
   const exponent = -Math.pow(x - mean, 2) / (2 * variance);
   return factor * Math.exp(exponent);
-};
-
-// Calculates Least Squares Linear Regression: y = mx + b and standard deviation
-const calculateRegression = (data) => {
-  if (!data || data.length < 2) return null;
-
-  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-  let n = 0;
-
-  data.forEach(d => {
-    const x = d.rVol;
-    const y = d.maxExcursionAdr;
-    if (x != null && y != null && isFinite(x) && isFinite(y)) {
-      sumX += x;
-      sumY += y;
-      sumXY += x * y;
-      sumXX += x * x;
-      n++;
-    }
-  });
-
-  if (n < 2) return null;
-
-  const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
-  const intercept = (sumY - slope * sumX) / n;
-
-  // Calculate standard deviation of the residuals
-  let sumSquaredResiduals = 0;
-  data.forEach(d => {
-    const x = d.rVol;
-    const y = d.maxExcursionAdr;
-    if (x != null && y != null && isFinite(x) && isFinite(y)) {
-      const predictedY = slope * x + intercept;
-      const residual = y - predictedY;
-      sumSquaredResiduals += Math.pow(residual, 2);
-    }
-  });
-
-  // standard deviation of the error (regression standard error)
-  const stdDev = Math.sqrt(sumSquaredResiduals / (n > 2 ? n - 2 : 1));
-
-  return {
-    slope,
-    intercept,
-    stdDev,
-    equation: `y = ${slope.toFixed(4)}x + ${intercept.toFixed(4)}`
-  };
 };
 
 // --- DATA SIMULATION & PROCESSING ---
@@ -183,6 +138,17 @@ export default function App() {
   const [adrPeriod, setAdrPeriod] = useState(20);
   const [customRvolThreshold, setCustomRvolThreshold] = useState('1.5');
 
+  // AI Training State
+  const [isTrainingAi, setIsTrainingAi] = useState(false);
+  const [aiTrainingEpoch, setAiTrainingEpoch] = useState(0);
+  const [aiTrainingLoss, setAiTrainingLoss] = useState(0);
+  const [aiTotalEpochs, setAiTotalEpochs] = useState(50);
+  const [aiResults, setAiResults] = useState(null);
+
+  // Manual AI Prediction State
+  const [manualAiInput, setManualAiInput] = useState('2.0');
+  const [manualAiResult, setManualAiResult] = useState(null);
+
   // Initial Load
   useEffect(() => {
     loadInitialData();
@@ -249,43 +215,27 @@ export default function App() {
   }, [rawMarketData, rvolPeriod, adrPeriod]);
 
   // Filter and sort data for Recharts (Sorting by X axis is crucial for Line charts)
-  const { chartData, regressionObj } = useMemo(() => {
+  const { chartData, historicalRegression } = useMemo(() => {
     const filtered = selectedTickerFilter === 'ALL'
       ? processedData
       : processedData.filter(d => d.ticker === selectedTickerFilter);
 
-    // Calculate Regression and SD
-    const regression = calculateRegression(filtered);
+    // Sort ascending by RVol
+    const sortedChartData = filtered.sort((a, b) => a.rVol - b.rVol);
 
-    // Sort ascending by RVol and attach the regression lines (mean and SD bands)
-    const sortedChartData = filtered
-      .sort((a, b) => a.rVol - b.rVol)
-      .map(point => {
-        let regressionY = null,
-          regressionYPlus1SD = null, regressionYMinus1SD = null,
-          regressionYPlus2SD = null, regressionYMinus2SD = null;
+    // Calculate Best Fit Regression
+    const points = sortedChartData.map(d => ({ x: d.rVol, y: d.maxExcursionAdr }));
+    const regression = findBestFitRegression(points);
 
-        if (regression) {
-          regressionY = (regression.slope * point.rVol) + regression.intercept;
-          regressionYPlus1SD = regressionY + regression.stdDev;
-          regressionYMinus1SD = regressionY - regression.stdDev;
-          regressionYPlus2SD = regressionY + 2 * regression.stdDev;
-          regressionYMinus2SD = regressionY - 2 * regression.stdDev;
-        }
-
-        return {
-          ...point,
-          regressionY,
-          regressionYPlus1SD,
-          regressionYMinus1SD,
-          regressionYPlus2SD,
-          regressionYMinus2SD,
-          equation: regression?.equation
-        };
-      });
-
-    return { chartData: sortedChartData, regressionObj: regression };
+    return { chartData: sortedChartData, historicalRegression: regression };
   }, [processedData, selectedTickerFilter]);
+
+  // AI Regression Tracker
+  const aiRegression = useMemo(() => {
+    if (!aiResults || !aiResults.predictionsMap || aiResults.predictionsMap.length < 3) return null;
+    const points = aiResults.predictionsMap.map(d => ({ x: d.rVol, y: d.lstmPredictedExc }));
+    return findBestFitRegression(points, 4);
+  }, [aiResults]);
 
   // Generate Statistical Summary Table Data
   const summaryStats = useMemo(() => {
@@ -315,6 +265,67 @@ export default function App() {
       };
     });
   }, [chartData]);
+
+  // Calculate RVol Distribution for Bell Curve
+  const handleTrainAI = async () => {
+    setIsTrainingAi(true);
+    setAiTrainingEpoch(0);
+    setAiResults(null);
+    setManualAiResult(null); // Clear previous
+    try {
+      const results = await runTfjsPipeline(chartData, aiTotalEpochs, (epoch, total, loss) => {
+        setAiTrainingEpoch(epoch);
+        setAiTotalEpochs(total);
+        setAiTrainingLoss(loss);
+      });
+      setAiResults(results);
+    } catch (err) {
+      console.error("AI Training Error", err);
+    }
+    setIsTrainingAi(false);
+  };
+
+  const handleManualPrediction = async () => {
+    if (!aiResults || !aiResults.model || !aiResults.preparedData) return;
+    const inputVal = parseFloat(manualAiInput);
+    if (isNaN(inputVal)) return;
+
+    // Normalizing the manual input based on the exact same constraints the model was built on
+    const { excMin, excMax, rvolMin, rvolMax, lastSequence } = aiResults.preparedData;
+
+    // We construct a sequence where the "past" is the last known sequence of the dataset, 
+    // but the "today" trigger is the user's manual input normalized.
+    // If the input is outside the bounds of what the model was trained on, normalize might extrapolate, which is fine for ML.
+    let normInputRvol = (inputVal - rvolMin) / (rvolMax - rvolMin);
+    // cap it functionally so it doesn't cause infinity
+    if (rvolMax - rvolMin === 0) normInputRvol = 0;
+
+    // Construct exactly as training: [pastRVol, pastExc, todaysRVol]
+    // We clone the base 'lastSequence' used in training to simulate the rolling history
+    const simulatedSequence = lastSequence.map((step, idx) => {
+      if (idx === lastSequence.length - 1) {
+        return [step[0], step[1], normInputRvol];
+      }
+      return [step[0], step[1], 0];
+    });
+
+    try {
+      // dynamic import for tf to avoid making App.jsx fully dependent on tfjs tree statically
+      const tf = await import('@tensorflow/tfjs');
+      const inputTensor = tf.tensor3d([simulatedSequence]);
+      const predTensor = aiResults.model.predict(inputTensor);
+      const predVal = (await predTensor.data())[0];
+
+      // Denormalize
+      const finalExcursion = (predVal * (excMax - excMin)) + excMin;
+      setManualAiResult(finalExcursion > 0 ? finalExcursion : 0); // floor at 0
+
+      inputTensor.dispose();
+      predTensor.dispose();
+    } catch (err) {
+      console.error("Manual inference failed", err);
+    }
+  };
 
   // Generate Advanced Statistical Analysis
   const advancedStats = useMemo(() => {
@@ -521,14 +532,79 @@ export default function App() {
       yaxis: 'y'
     });
 
-    // Regression Lines
-    if (regressionObj) {
-      const sortedChartData = [...chartData].sort((a, b) => a.rVol - b.rVol);
-      const rx = sortedChartData.map(d => d.rVol);
+    // Historical Best Fit Line
+    if (historicalRegression) {
+      // Calculate smooth smooth plot across the domain
+      const xMin = Math.min(...x);
+      const xMax = Math.max(...x);
+      const smoothX = [];
+      const smoothY = [];
+      if (isFinite(xMin) && isFinite(xMax) && xMax > xMin) {
+        const step = (xMax - xMin) / 100;
+        for (let i = xMin; i <= xMax; i += step) {
+          smoothX.push(i);
+          smoothY.push(historicalRegression.predict(i));
+        }
+      }
 
       traces.push({
-        x: rx, y: sortedChartData.map(d => d.regressionY),
-        mode: 'lines', type: 'scatter', name: 'Trendline', line: { color: '#ef4444', width: 2 }, hoverinfo: 'skip'
+        x: smoothX, y: smoothY,
+        mode: 'lines', type: 'scatter', name: `Historical Trend (${historicalRegression.type})`,
+        line: { color: '#ef4444', width: 2 }, hoverinfo: 'skip'
+      });
+    }
+
+    // AI Best Fit Line
+    if (aiRegression) {
+      const rx = aiResults.predictionsMap.map(d => d.rVol);
+      const xMin = Math.min(...rx);
+      const xMax = Math.max(...rx);
+      const aiSmoothX = [];
+      const aiSmoothY = [];
+      if (isFinite(xMin) && isFinite(xMax) && xMax > xMin) {
+        const step = (xMax - xMin) / 100;
+        for (let i = xMin; i <= xMax; i += step) {
+          aiSmoothX.push(i);
+          aiSmoothY.push(aiRegression.predict(i));
+        }
+      }
+
+      traces.push({
+        x: aiSmoothX, y: aiSmoothY,
+        mode: 'lines', type: 'scatter', name: `AI Trend (${aiRegression.type})`,
+        line: { color: '#a855f7', width: 2, dash: 'dash' }, hoverinfo: 'skip'
+      });
+    }
+
+    // LSTM AI Predictor Trace
+    if (aiResults && aiResults.predictionsMap) {
+      traces.push({
+        x: aiResults.predictionsMap.map(d => d.rVol),
+        y: aiResults.predictionsMap.map(d => d.lstmPredictedExc),
+        mode: 'markers',
+        type: 'scatter',
+        name: 'AI Prediction',
+        marker: { color: '#9333ea', symbol: 'star-diamond', size: 10, opacity: 0.9, line: { color: '#ffffff', width: 1 } },
+        text: aiResults.predictionsMap.map(d => `<b>LSTM Predicted</b><br>Historical RVol: ${d.rVol.toFixed(2)}x<br>Predicted Exc: ${d.lstmPredictedExc.toFixed(2)}x ADR`),
+        hoverinfo: 'text',
+        xaxis: 'x',
+        yaxis: 'y'
+      });
+    }
+
+    // Manual AI Input Trace Marker
+    if (manualAiResult !== null) {
+      traces.push({
+        x: [parseFloat(manualAiInput)],
+        y: [manualAiResult],
+        mode: 'markers',
+        type: 'scatter',
+        name: 'Your Manual Input',
+        marker: { color: '#f59e0b', symbol: 'star', size: 16, line: { color: '#ffffff', width: 2 } },
+        text: [`<b>Manual Input Prediction</b><br>RVol Input: ${manualAiInput}x<br>Predicted Exc: ${manualAiResult.toFixed(2)}x`],
+        hoverinfo: 'text',
+        xaxis: 'x',
+        yaxis: 'y'
       });
     }
 
@@ -647,7 +723,7 @@ export default function App() {
     };
 
     return { traces, layout };
-  }, [chartData, regressionObj, rvolDistributionData, excDistributionData, rvolStats, excStats]);
+  }, [chartData, historicalRegression, aiRegression, rvolDistributionData, excDistributionData, rvolStats, excStats, manualAiResult, manualAiInput, aiResults]);
 
   // Selected Ticker Data for Candlestick Chart
   const apexChartState = useMemo(() => {
@@ -667,49 +743,69 @@ export default function App() {
           currentEma = (hClose * k) + (currentEma * (1 - k));
         }
         const time = typeof raw[i].date === 'string' ? raw[i].date.split('T')[0] : raw[i].date.toISOString().split('T')[0];
-        emaArr.push({ x: new Date(time).getTime(), y: parseFloat(currentEma.toFixed(2)) });
+        emaArr.push({ x: time, y: parseFloat(currentEma.toFixed(2)), timestamp: new Date(time).getTime() });
       }
       return emaArr;
     };
 
+    const ema10Full = calcEma(10);
+    const ema20Full = calcEma(20);
+    const ema50Full = calcEma(50);
+
+    const maxDate = new Date(raw[raw.length - 1]?.date || Date.now());
+    const minDate = new Date(maxDate);
+    minDate.setMonth(minDate.getMonth() - 6);
+    const minTime = minDate.getTime();
+
     const candleData = [];
     const volumeData = [];
-    raw.forEach(d => {
+    raw.forEach((d, i) => {
       const time = typeof d.date === 'string' ? d.date.split('T')[0] : d.date.toISOString().split('T')[0];
       const timeMs = new Date(time).getTime();
-      const o = d.open || 0;
-      const h = d.high || 0;
-      const l = d.low || 0;
-      const c = d.close || 0;
-      candleData.push({
-        x: timeMs,
-        y: [
-          parseFloat(o.toFixed(2)),
-          parseFloat(h.toFixed(2)),
-          parseFloat(l.toFixed(2)),
-          parseFloat(c.toFixed(2))
-        ]
-      });
-      volumeData.push({
-        x: timeMs,
-        y: d.volume
-      });
+
+      if (timeMs >= minTime) {
+        const o = d.open || 0;
+        const h = d.high || 0;
+        const l = d.low || 0;
+        const c = d.close || 0;
+
+        let color = '#cbd5e1'; // default slate-300
+        if (c > o) color = '#22c55e'; // green
+        else if (c < o) color = '#ef4444'; // red
+        else if (i > 0) {
+          const prevC = raw[i - 1].close || 0;
+          color = c >= prevC ? '#22c55e' : '#ef4444';
+        }
+
+        candleData.push({
+          x: time,
+          y: [
+            parseFloat(o.toFixed(2)),
+            parseFloat(h.toFixed(2)),
+            parseFloat(l.toFixed(2)),
+            parseFloat(c.toFixed(2))
+          ]
+        });
+        volumeData.push({
+          x: time,
+          y: d.volume,
+          fillColor: color
+        });
+      }
     });
+
+    const filterEma = (arr) => arr.filter(item => item.timestamp >= minTime).map(item => ({ x: item.x, y: item.y }));
 
     const priceSeries = [
       { name: 'Candle', type: 'candlestick', data: candleData },
-      { name: '10 EMA', type: 'line', data: calcEma(10) },
-      { name: '20 EMA', type: 'line', data: calcEma(20) },
-      { name: '50 EMA', type: 'line', data: calcEma(50) }
+      { name: '10 EMA', type: 'line', data: filterEma(ema10Full) },
+      { name: '20 EMA', type: 'line', data: filterEma(ema20Full) },
+      { name: '50 EMA', type: 'line', data: filterEma(ema50Full) }
     ];
 
     const volumeSeries = [
       { name: 'Volume', type: 'bar', data: volumeData }
     ];
-
-    const maxDate = new Date(raw[raw.length - 1]?.date || Date.now());
-    const minDate = new Date(maxDate);
-    minDate.setMonth(minDate.getMonth() - 6);
 
     const priceOptions = {
       chart: {
@@ -722,12 +818,11 @@ export default function App() {
         animations: { enabled: false }
       },
       xaxis: {
-        type: 'datetime',
-        min: minDate.getTime(),
-        max: maxDate.getTime(),
+        type: 'category',
         labels: { show: false },
         axisBorder: { show: false },
-        axisTicks: { show: false }
+        axisTicks: { show: false },
+        tickAmount: 10
       },
       yaxis: {
         decimalsInFloat: 2,
@@ -762,10 +857,9 @@ export default function App() {
         animations: { enabled: false }
       },
       xaxis: {
-        type: 'datetime',
-        min: minDate.getTime(),
-        max: maxDate.getTime(),
-        labels: { style: { colors: '#64748b' } }
+        type: 'category',
+        labels: { style: { colors: '#64748b' } },
+        tickAmount: 10
       },
       yaxis: {
         decimalsInFloat: 0,
@@ -779,7 +873,6 @@ export default function App() {
           }
         }
       },
-      colors: ['#cbd5e1'],
       legend: { show: false },
       tooltip: { shared: false },
       dataLabels: { enabled: false }
@@ -787,9 +880,6 @@ export default function App() {
 
     return { priceOptions, priceSeries, volumeOptions, volumeSeries };
   }, [selectedTickerFilter, rawMarketData]);
-
-  const regressionEquation = regressionObj ? regressionObj.equation : null;
-  const regressionStdDev = regressionObj && regressionObj.stdDev ? regressionObj.stdDev.toFixed(4) : null;
 
   // Custom Tooltip for Chart
   const CustomTooltip = ({ active, payload }) => {
@@ -922,6 +1012,88 @@ export default function App() {
           </div>
         </div>
 
+        {/* AI Predictor Controls */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
+          <div className="flex justify-between items-center">
+            <div>
+              <h2 className="text-lg font-bold text-slate-800">Neural Network Predictor (LSTM)</h2>
+              <p className="text-xs text-slate-500">Train an AI model directly in your browser to predict Excursion based on sequence history.</p>
+            </div>
+            <button
+              onClick={handleTrainAI}
+              disabled={isTrainingAi || chartData.length < 10}
+              className={`py-2 px-6 rounded-md font-semibold text-white transition-colors ${isTrainingAi ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
+            >
+              {isTrainingAi ? `Training... Epoch ${aiTrainingEpoch}/${aiTotalEpochs}` : 'Train AI Predictor'}
+            </button>
+          </div>
+
+          {isTrainingAi && (
+            <div className="w-full bg-slate-200 rounded-full h-2 mb-1">
+              <div className="bg-purple-600 h-2 rounded-full transition-all duration-300" style={{ width: `${(aiTrainingEpoch / aiTotalEpochs) * 100}%` }}></div>
+              <p className="text-xs text-slate-500 mt-2 text-right">Current Loss: {aiTrainingLoss.toFixed(4)}</p>
+            </div>
+          )}
+
+          {aiResults && !isTrainingAi && (
+            <div className="bg-purple-50 border border-purple-200 p-4 rounded-lg flex flex-col gap-4">
+              <div className="flex flex-col xl:flex-row justify-between xl:items-center gap-4 border-b border-purple-200/50 pb-4">
+                <div>
+                  <h3 className="font-bold text-purple-900">Training Complete</h3>
+                  <p className="text-xs text-purple-700">LSTM Final Loss: {aiResults.finalLoss.toFixed(4)}</p>
+                  <p className="text-xs text-purple-600 mt-1 font-medium">The AI predictions are now plotted as Purple Diamonds on the chart below.</p>
+                </div>
+                <div className="flex gap-4">
+                  <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px]">
+                    <span className="text-xs text-slate-500 font-bold uppercase text-center">Historical Fit (R²)</span>
+                    <span className="text-lg font-mono text-slate-800">{historicalRegression ? historicalRegression.r2.toFixed(4) : 'N/A'}</span>
+                  </div>
+                  <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px] border-b-2 border-purple-500 relative flex-shrink-0">
+                    <span className="text-xs text-slate-500 font-bold uppercase text-center">AI Fit (R²)</span>
+                    <span className="text-lg font-mono text-purple-700 font-semibold">{aiRegression ? aiRegression.r2.toFixed(4) : 'N/A'}</span>
+                    {historicalRegression && aiRegression && aiRegression.r2 > historicalRegression.r2 && (
+                      <div className="absolute -top-2 -right-2 bg-green-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow">WINS</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Manual Inference Predictor Panel */}
+              <div className="pt-2 flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                <div className="flex-1">
+                  <p className="text-sm font-bold text-purple-900">Manual AI Prediction</p>
+                  <p className="text-xs text-purple-700">Ask the trained Neural Network directly. Input a hypothetical RVol scenario for today to see its prediction.</p>
+                </div>
+                <div className="flex items-center shadow-sm rounded-md overflow-hidden border border-purple-300 w-full sm:w-auto">
+                  <div className="bg-purple-100 text-purple-800 px-3 py-2 text-xs font-bold border-r border-purple-200 uppercase tracking-wide flex-shrink-0">
+                    Input RVol
+                  </div>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    value={manualAiInput}
+                    onChange={e => setManualAiInput(e.target.value)}
+                    className="w-24 px-3 py-2 outline-none font-bold text-slate-800 flex-shrink-0"
+                  />
+                  <button
+                    onClick={handleManualPrediction}
+                    className="bg-purple-600 hover:bg-purple-700 text-white transition-colors px-4 py-2 text-sm font-bold flex-shrink-0 border-l border-purple-700"
+                  >
+                    Predict
+                  </button>
+                </div>
+                {manualAiResult !== null && (
+                  <div className="bg-white border-2 border-amber-400 p-2 rounded-md shadow-sm ml-auto text-center flex-shrink-0 min-w-[120px]">
+                    <span className="block text-[10px] uppercase font-bold text-slate-500">LSTM Output</span>
+                    <span className="block text-lg font-black text-slate-800">{manualAiResult.toFixed(2)}x <span className="text-xs text-slate-500 font-normal">ADR</span></span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Main Visualization */}
         {marginalPlotState && (
           <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -930,10 +1102,16 @@ export default function App() {
                 <h2 className="text-lg font-bold text-slate-800">Scatter Plot with Probability Distributions</h2>
                 <p className="text-xs text-slate-500">Y-Axis: Absolute Max Excursion Multiple. X-Axis: Relative Volume.</p>
               </div>
-              {regressionEquation && (
+              {historicalRegression && (
                 <div className="mt-2 sm:mt-0 bg-blue-50 border border-blue-200 text-blue-800 text-xs px-3 py-1 rounded-full font-semibold">
-                  <span className="font-mono">Relationship: {regressionEquation}</span>
-                  <span className="ml-2 text-blue-600 block sm:inline">| SD: ±{regressionStdDev}</span>
+                  <span className="mr-2">Historical Fit ({historicalRegression.type}):</span>
+                  <span className="font-mono">{historicalRegression.equation}</span>
+                </div>
+              )}
+              {aiRegression && (
+                <div className="mt-2 sm:mt-0 bg-purple-50 border border-purple-200 text-purple-800 text-xs px-3 py-1 rounded-full font-semibold ml-2">
+                  <span className="mr-2">AI Fit ({aiRegression.type}):</span>
+                  <span className="font-mono">{aiRegression.equation}</span>
                 </div>
               )}
             </div>
@@ -950,51 +1128,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Statistical Summary Table */}
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-          <div className="p-6 border-b border-slate-200">
-            <h2 className="text-lg font-bold text-slate-800">Intraday Excursion by RVol Bucket</h2>
-            <p className="text-xs text-slate-500">Grouped analysis showing the mathematical expansion from the day's open to the high or low.</p>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left text-slate-600">
-              <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
-                <tr>
-                  <th scope="col" className="px-6 py-4 font-bold">RVol Bucket</th>
-                  <th scope="col" className="px-6 py-4 text-center">Sample Size</th>
-                  <th scope="col" className="px-6 py-4 text-center">RVol Prob.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Median Max Exc.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">&ge; Median Exc Prob.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Mean Max Exc.</th>
-                  <th scope="col" className="px-6 py-4 text-right font-bold text-slate-800 whitespace-nowrap">Absolute Max Exc.</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summaryStats.map((row, idx) => (
-                  <tr key={idx} className="bg-white border-b hover:bg-slate-50 transition-colors">
-                    <td className="px-6 py-4 font-semibold text-slate-900 whitespace-nowrap">
-                      {row.label}
-                    </td>
-                    <td className="px-6 py-4 text-center">
-                      <span className="bg-slate-100 text-slate-700 py-1 px-3 rounded-full text-xs font-medium">
-                        {row.sampleSize}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-center text-slate-500 font-medium">
-                      {row.sampleSize > 0 ? `${row.rvolProbability}%` : '-'}
-                    </td>
-                    <td className="px-6 py-4 text-right font-medium">{row.medianExcursion ? `${row.medianExcursion}x` : '-'}</td>
-                    <td className="px-6 py-4 text-right text-slate-500 font-medium whitespace-nowrap" title={`Probability of any day having an excursion of >= ${row.medianExcursion}x`}>
-                      {row.medianExcursionProb && row.sampleSize > 0 ? `${row.medianExcursionProb}%` : '-'}
-                    </td>
-                    <td className="px-6 py-4 text-right">{row.meanExcursion ? `${row.meanExcursion}x` : '-'}</td>
-                    <td className="px-6 py-4 text-right text-red-600 font-bold">{row.maxExcursion ? `${row.maxExcursion}x` : '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
 
         {/* Advanced Statistical Analysis: High Excursion Probabilities */}
         {advancedStats.length > 0 && (
@@ -1113,7 +1246,53 @@ export default function App() {
               )}
             </div>
           </div>
-        )}        {/* Selected Ticker Stock Chart */}
+        )}        {/* Statistical Summary Table Moved Below Chart */}
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mt-6">
+          <div className="p-6 border-b border-slate-200">
+            <h2 className="text-lg font-bold text-slate-800">Intraday Excursion by RVol Bucket</h2>
+            <p className="text-xs text-slate-500">Grouped analysis showing the mathematical expansion from the day's open to the high or low.</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left text-slate-600">
+              <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th scope="col" className="px-6 py-4 font-bold">RVol Bucket</th>
+                  <th scope="col" className="px-6 py-4 text-center">Sample Size</th>
+                  <th scope="col" className="px-6 py-4 text-center">RVol Prob.</th>
+                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Median Max Exc.</th>
+                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">&ge; Median Exc Prob.</th>
+                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Mean Max Exc.</th>
+                  <th scope="col" className="px-6 py-4 text-right font-bold text-slate-800 whitespace-nowrap">Absolute Max Exc.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summaryStats.map((row, idx) => (
+                  <tr key={idx} className="bg-white border-b hover:bg-slate-50 transition-colors">
+                    <td className="px-6 py-4 font-semibold text-slate-900 whitespace-nowrap">
+                      {row.label}
+                    </td>
+                    <td className="px-6 py-4 text-center">
+                      <span className="bg-slate-100 text-slate-700 py-1 px-3 rounded-full text-xs font-medium">
+                        {row.sampleSize}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-center text-slate-500 font-medium">
+                      {row.sampleSize > 0 ? `${row.rvolProbability}%` : '-'}
+                    </td>
+                    <td className="px-6 py-4 text-right font-medium">{row.medianExcursion ? `${row.medianExcursion}x` : '-'}</td>
+                    <td className="px-6 py-4 text-right text-slate-500 font-medium whitespace-nowrap" title={`Probability of any day having an excursion of >= ${row.medianExcursion}x`}>
+                      {row.medianExcursionProb && row.sampleSize > 0 ? `${row.medianExcursionProb}%` : '-'}
+                    </td>
+                    <td className="px-6 py-4 text-right">{row.meanExcursion ? `${row.meanExcursion}x` : '-'}</td>
+                    <td className="px-6 py-4 text-right text-red-600 font-bold">{row.maxExcursion ? `${row.maxExcursion}x` : '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Selected Ticker Stock Chart */}
         {selectedTickerFilter !== 'ALL' && apexChartState && (
           <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mt-6">
             <div className="mb-4">
@@ -1138,6 +1317,7 @@ export default function App() {
             </div>
           </div>
         )}
+
 
       </div>
     </div>
