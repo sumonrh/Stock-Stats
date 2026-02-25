@@ -146,6 +146,9 @@ export default function App() {
     new Array(11).fill(true) // one boolean per feature, all on by default
   );
   const [maxExcSaveStatus, setMaxExcSaveStatus] = useState(null);
+  const [predTicker, setPredTicker] = useState('');
+  const [predChartData, setPredChartData] = useState(null);
+  const [isPredicting, setIsPredicting] = useState(false);
   // --------------------------
 
   // Initial Load
@@ -748,6 +751,118 @@ export default function App() {
     } catch (err) {
       console.error(err);
     }
+  };
+
+  const handleChartPrediction = async () => {
+    if (!maxExcResults?.model || !maxExcResults?.preparedData) {
+      alert('Please train the model first!');
+      return;
+    }
+    const ticker = predTicker.trim().toUpperCase();
+    if (!ticker) return;
+
+    setIsPredicting(true);
+    setPredChartData(null);
+
+    try {
+      // 1. Fetch daily OHLCV from Yahoo Finance
+      const dailyRes = await fetch(`/api/yahoo-finance2?ticker=${ticker}`);
+      const dailyData = await dailyRes.json();
+      if (!dailyData || dailyData.length === 0) throw new Error('No daily data for ' + ticker);
+
+      // 2. Fetch intraday 5-min bars
+      const intraRes = await fetch(`/api/intraday-data?ticker=${ticker}`);
+      const intraData = intraRes.ok ? await intraRes.json() : [];
+
+      // 3. Fetch daily features (ADR, ATR, EMAs)
+      const featRes = await fetch(`/api/intraday-features?ticker=${ticker}`);
+      const featData = featRes.ok ? await featRes.json() : [];
+
+      // Build date lookups
+      const intraByDate = {};
+      for (const day of intraData) {
+        intraByDate[day.date] = day;
+      }
+      const featByDate = {};
+      for (const feat of featData) {
+        featByDate[feat.date] = feat;
+      }
+
+      const { normParams, activeIndices } = maxExcResults.preparedData;
+      const maxBars = Math.floor(maxExcMinutes / 5);
+
+      // Last 90 trading days
+      const last90 = dailyData.slice(-90);
+
+      const candlestick = [];
+      const predHighDots = [];
+      const predLowDots = [];
+      let predictedCount = 0;
+
+      for (const day of last90) {
+        const dateStr = new Date(day.date).toISOString().split('T')[0];
+        const ts = new Date(dateStr).getTime();
+
+        candlestick.push({ x: ts, y: [day.open, day.high, day.low, day.close] });
+
+        // Run prediction if we have intraday + features for this day
+        const intra = intraByDate[dateStr];
+        const feat = featByDate[dateStr];
+
+        if (intra && feat && intra.bars && intra.bars.length >= maxBars &&
+          feat.adr20 > 0 && feat.avgVol50 > 0 && intra.dayOpen > 0) {
+          const earlyBars = intra.bars.slice(0, maxBars);
+          const earlyVolSum = earlyBars.reduce((s, b) => s + b.volume, 0);
+          const projectedRVol = (earlyVolSum * (78 / maxBars)) / feat.avgVol50;
+          const firstBarVolRatio = earlyBars[0].volume / feat.avgVol50;
+
+          let earlyHigh = -Infinity, earlyLow = Infinity;
+          for (const b of earlyBars) {
+            if (b.high > earlyHigh) earlyHigh = b.high;
+            if (b.low < earlyLow) earlyLow = b.low;
+          }
+          const earlyRangeOverAdr = feat.adr20 > 0 ? (earlyHigh - earlyLow) / feat.adr20 : 0;
+
+          const lastEarlyClose = earlyBars[earlyBars.length - 1].close;
+          const pctAboveOpen = intra.dayOpen > 0 ? ((lastEarlyClose - intra.dayOpen) / intra.dayOpen) * 100 : 0;
+
+          let upVol = 0, downVol = 0;
+          for (const b of earlyBars) {
+            if (b.close >= b.open) upVol += b.volume;
+            else downVol += b.volume;
+          }
+          const upDownRatio = downVol > 0 ? upVol / downVol : (upVol > 0 ? 10 : 1);
+
+          const normAdr = intra.dayOpen > 0 ? feat.adr20 / intra.dayOpen : 0;
+          const normAtr = intra.dayOpen > 0 ? feat.atr14 / intra.dayOpen : 0;
+
+          const featureVector = [
+            projectedRVol, feat.prevCloseChange || 0, firstBarVolRatio,
+            earlyRangeOverAdr, pctAboveOpen, upDownRatio,
+            normAdr, normAtr,
+            feat.atrDistEma10 || 0, feat.atrDistEma20 || 0, feat.atrDistEma50 || 0
+          ];
+
+          const exc = await predictMaxExcursion(maxExcResults.model, normParams, featureVector, activeIndices);
+          const predHigh = intra.dayOpen + exc * feat.adr20;
+          const predLow = intra.dayOpen - exc * feat.adr20;
+
+          predHighDots.push({ x: ts, y: parseFloat(predHigh.toFixed(2)) });
+          predLowDots.push({ x: ts, y: parseFloat(predLow.toFixed(2)) });
+          predictedCount++;
+        } else {
+          // Push null values so ApexCharts keeps X-axis synchronization perfect
+          predHighDots.push({ x: ts, y: null });
+          predLowDots.push({ x: ts, y: null });
+        }
+      }
+
+      setPredChartData({ candlestick, predHighDots, predLowDots, ticker, predictedCount, totalDays: last90.length });
+    } catch (err) {
+      console.error('Chart prediction error:', err);
+      alert('Error: ' + err.message);
+    }
+    setIsPredicting(false);
   };
 
   // Generate Advanced Statistical Analysis
@@ -2194,52 +2309,107 @@ export default function App() {
               </div>
             </div>
 
-            {/* Manual Prediction Input */}
+            {/* Live Prediction Chart */}
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
-              <h3 className="text-lg font-bold text-slate-800">Live Prediction</h3>
-              <p className="text-sm text-slate-500">Enter today's open price and first bar volume to get predicted High/Low.</p>
+              <div>
+                <h3 className="text-lg font-bold text-slate-800">Live Prediction Chart</h3>
+                <p className="text-sm text-slate-500">Enter a ticker to see predicted High/Low overlaid on the last 90 days of price data.</p>
+              </div>
               <div className="flex flex-col sm:flex-row gap-4 items-end">
                 <div className="flex flex-col flex-1">
-                  <label className="text-xs font-semibold text-slate-600 mb-1">Open Price ($)</label>
-                  <input
-                    type="number" step="0.01" placeholder="e.g. 55.00"
-                    value={manualMaxExcInput.open}
-                    onChange={e => setManualMaxExcInput(prev => ({ ...prev, open: e.target.value }))}
-                    className="border border-slate-300 rounded-md p-2 text-sm outline-none focus:ring-emerald-500 focus:border-emerald-500"
-                  />
-                </div>
-                <div className="flex flex-col flex-1">
-                  <label className="text-xs font-semibold text-slate-600 mb-1">First Bar Volume</label>
-                  <input
-                    type="number" placeholder="e.g. 350000"
-                    value={manualMaxExcInput.volume}
-                    onChange={e => setManualMaxExcInput(prev => ({ ...prev, volume: e.target.value }))}
-                    className="border border-slate-300 rounded-md p-2 text-sm outline-none focus:ring-emerald-500 focus:border-emerald-500"
-                  />
+                  <label className="text-xs font-semibold text-slate-600 mb-1">Ticker Symbol</label>
+                  <select
+                    value={predTicker}
+                    onChange={e => setPredTicker(e.target.value)}
+                    className="border border-slate-300 bg-white rounded-md p-2 text-sm outline-none focus:ring-emerald-500 focus:border-emerald-500 w-full"
+                  >
+                    <option value="" disabled>Select a ticker</option>
+                    {intradayFiles.map(f => (
+                      <option key={f.ticker} value={f.ticker}>{f.ticker}</option>
+                    ))}
+                  </select>
                 </div>
                 <button
-                  onClick={handleManualMaxExcPrediction}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-2 rounded-md text-sm transition-colors whitespace-nowrap"
+                  onClick={handleChartPrediction}
+                  disabled={isPredicting || !predTicker.trim()}
+                  className={`px-6 py-2 rounded-md font-bold text-white text-sm transition-colors whitespace-nowrap shadow-sm ${isPredicting ? 'bg-slate-400 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-700'}`}
                 >
-                  Predict High/Low
+                  {isPredicting ? 'Loading...' : 'Predict High / Low'}
                 </button>
               </div>
 
-              {maxExcPrediction && (
-                <div className="flex flex-col md:flex-row gap-4 mt-2">
-                  <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-lg flex-1 text-center">
-                    <span className="block text-xs font-bold text-emerald-700 uppercase mb-1">Predicted High</span>
-                    <span className="block text-2xl font-black text-emerald-800">${maxExcPrediction.predictedHigh.toFixed(2)}</span>
+              {predChartData && (
+                <div className="mt-2">
+                  <div className="flex items-center gap-4 mb-3 text-xs">
+                    <span className="font-bold text-slate-700">{predChartData.ticker} — Last {predChartData.totalDays} days</span>
+                    <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-emerald-500"></span> Predicted High ({predChartData.predHighDots.length} days)</span>
+                    <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-rose-500"></span> Predicted Low ({predChartData.predLowDots.length} days)</span>
                   </div>
-                  <div className="bg-red-50 border border-red-200 p-4 rounded-lg flex-1 text-center">
-                    <span className="block text-xs font-bold text-red-700 uppercase mb-1">Predicted Low</span>
-                    <span className="block text-2xl font-black text-red-800">${maxExcPrediction.predictedLow.toFixed(2)}</span>
-                  </div>
-                  <div className="bg-amber-50 border border-amber-200 p-4 rounded-lg flex-1 text-center">
-                    <span className="block text-xs font-bold text-amber-700 uppercase mb-1">Max Excursion (ADR)</span>
-                    <span className="block text-2xl font-black text-amber-800">{maxExcPrediction.excursionAdr.toFixed(2)}x</span>
-                    <span className="block text-xs text-amber-600">Projected RVol: {maxExcPrediction.projectedRVol.toFixed(2)}x</span>
-                  </div>
+                  <ReactApexChart
+                    type="candlestick"
+                    height={420}
+                    series={[
+                      { name: 'Price', type: 'candlestick', data: predChartData.candlestick },
+                      { name: 'Predicted High', type: 'line', data: predChartData.predHighDots },
+                      { name: 'Predicted Low', type: 'line', data: predChartData.predLowDots }
+                    ]}
+                    options={{
+                      chart: {
+                        type: 'candlestick',
+                        toolbar: { show: true, tools: { download: true, zoom: true, pan: true, reset: true } },
+                        background: '#fff'
+                      },
+                      title: { text: undefined },
+                      xaxis: {
+                        type: 'datetime',
+                        labels: { datetimeFormatter: { month: "MMM 'yy", day: 'dd MMM' } }
+                      },
+                      yaxis: {
+                        tooltip: { enabled: true },
+                        labels: { formatter: v => '$' + v.toFixed(2) }
+                      },
+                      plotOptions: {
+                        candlestick: {
+                          colors: { upward: '#22c55e', downward: '#ef4444' },
+                          wick: { useFillColor: true }
+                        }
+                      },
+                      stroke: {
+                        width: [1, 0, 0]
+                      },
+                      markers: {
+                        size: [0, 7, 7],
+                        colors: [undefined, '#10b981', '#f43f5e'],
+                        strokeColors: [undefined, '#059669', '#e11d48'],
+                        strokeWidth: 2,
+                        hover: { sizeOffset: 2 }
+                      },
+                      legend: {
+                        show: true,
+                        position: 'top',
+                        labels: { colors: '#475569' },
+                        markers: { fillColors: ['#64748b', '#10b981', '#f43f5e'] }
+                      },
+                      tooltip: {
+                        shared: false,
+                        custom: function ({ seriesIndex, dataPointIndex, w }) {
+                          const s = w.config.series[seriesIndex];
+                          const point = s.data[dataPointIndex];
+                          if (!point) return '';
+                          const date = new Date(point.x).toLocaleDateString();
+                          if (seriesIndex === 0) {
+                            const [o, h, l, c] = point.y;
+                            return `<div style="padding:8px;font-size:12px"><b>${date}</b><br/>O: $${o.toFixed(2)} H: $${h.toFixed(2)}<br/>L: $${l.toFixed(2)} C: $${c.toFixed(2)}</div>`;
+                          } else {
+                            const label = seriesIndex === 1 ? 'Predicted High' : 'Predicted Low';
+                            const color = seriesIndex === 1 ? '#10b981' : '#f43f5e';
+                            return `<div style="padding:8px;font-size:12px"><b>${date}</b><br/><span style="color:${color};font-weight:bold">${label}: $${point.y.toFixed(2)}</span></div>`;
+                          }
+                        }
+                      },
+                      grid: { borderColor: '#e2e8f0', strokeDashArray: 3 }
+                    }}
+                  />
                 </div>
               )}
             </div>
@@ -2257,15 +2427,32 @@ export default function App() {
                       onClick={async () => {
                         setMaxExcSaveStatus('Saving...');
                         try {
-                          const res = await saveModelToServer(maxExcResults.model, maxExcResults.preparedData, 'maxExcursion');
+                          // Only save essential metadata, not the full training arrays
+                          const metadataToSave = {
+                            normParams: maxExcResults.preparedData.normParams,
+                            featureNames: maxExcResults.preparedData.featureNames,
+                            allFeatureNames: maxExcResults.preparedData.allFeatureNames,
+                            featureMask: maxExcResults.preparedData.featureMask,
+                            activeIndices: maxExcResults.preparedData.activeIndices,
+                            rSquared: maxExcResults.rSquared,
+                            mse: maxExcResults.mse,
+                            stdDev: maxExcResults.stdDev,
+                            dataPoints: maxExcResults.predictionsMap.length,
+                            trainedAt: new Date().toISOString()
+                          };
+                          const res = await saveModelToServer(maxExcResults.model, metadataToSave, 'maxExcursion');
                           if (res.success) {
                             setMaxExcSaveStatus('Saved to max-excursion/');
                             setTimeout(() => setMaxExcSaveStatus(null), 3000);
                           } else {
-                            setMaxExcSaveStatus('Save failed!');
+                            console.error('Save error:', res.error);
+                            setMaxExcSaveStatus('Save failed: ' + (res.error || 'unknown'));
+                            setTimeout(() => setMaxExcSaveStatus(null), 5000);
                           }
                         } catch (err) {
-                          setMaxExcSaveStatus('Save failed!');
+                          console.error('Save exception:', err);
+                          setMaxExcSaveStatus('Save failed: ' + err.message);
+                          setTimeout(() => setMaxExcSaveStatus(null), 5000);
                         }
                       }}
                       disabled={!!maxExcSaveStatus}
