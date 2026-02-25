@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { ComposedChart, Scatter, Line, Bar, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, Legend } from 'recharts';
+import { ComposedChart, Scatter, Line, BarChart, Bar, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, Legend, Label } from 'recharts';
 import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
-import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadModelFiles, evaluateLstmOnData } from './utils/tfjsEngine';
+import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadModelFiles, evaluateLstmOnData, evaluateIntradayModel, runIntradayTfjsPipeline, saveModelToServer, runMaxExcursionPipeline, runSensitivityAnalysis, predictMaxExcursion } from './utils/tfjsEngine';
 import { findBestFitRegression } from './utils/mathUtils';
 
 // --- CONFIGURATION ---
@@ -112,6 +112,42 @@ export default function App() {
   const [manualAiInput, setManualAiInput] = useState('2.0');
   const [manualAiResult, setManualAiResult] = useState(null);
 
+  // --- INTRADAY NEW STATE ---
+  const [activeTab, setActiveTab] = useState('daily'); // 'daily' | 'intraday'
+  const [intradayFiles, setIntradayFiles] = useState([]);
+  const [intradayData, setIntradayData] = useState({}); // { ticker: data }
+  const [selectedIntradayTicker, setSelectedIntradayTicker] = useState('ALL');
+  const [minutesToUse, setMinutesToUse] = useState(30);
+
+  const [isIntradayLoading, setIsIntradayLoading] = useState(false);
+  const [isIntradayTraining, setIsIntradayTraining] = useState(false);
+  const [intradayTrainEpoch, setIntradayTrainEpoch] = useState(0);
+  const [intradayTrainLoss, setIntradayTrainLoss] = useState(0);
+  const [intradayAiResults, setIntradayAiResults] = useState(null);
+
+  const [manualIntradayInputStr, setManualIntradayInputStr] = useState('500000, 200000, 150000');
+  const [manualIntradayResult, setManualIntradayResult] = useState(null);
+  const [intradaySaveStatus, setIntradaySaveStatus] = useState(null);
+
+  // --- MAX EXCURSION PREDICTOR STATE ---
+  const [isMaxExcTraining, setIsMaxExcTraining] = useState(false);
+  const [maxExcTrainEpoch, setMaxExcTrainEpoch] = useState(0);
+  const [maxExcTotalEpochs, setMaxExcTotalEpochs] = useState(80);
+  const [maxExcTrainLoss, setMaxExcTrainLoss] = useState(0);
+  const [maxExcResults, setMaxExcResults] = useState(null);
+  const [maxExcSensitivity, setMaxExcSensitivity] = useState(null);
+  const [isRunningSensitivity, setIsRunningSensitivity] = useState(false);
+  const [selectedMaxExcTicker, setSelectedMaxExcTicker] = useState('ALL');
+  const [maxExcMinutes, setMaxExcMinutes] = useState(5);
+  const [maxExcDailyFeatures, setMaxExcDailyFeatures] = useState({});
+  const [manualMaxExcInput, setManualMaxExcInput] = useState({ open: '', volume: '' });
+  const [maxExcPrediction, setMaxExcPrediction] = useState(null);
+  const [enabledFeatures, setEnabledFeatures] = useState(
+    new Array(11).fill(true) // one boolean per feature, all on by default
+  );
+  const [maxExcSaveStatus, setMaxExcSaveStatus] = useState(null);
+  // --------------------------
+
   // Initial Load
   useEffect(() => {
     loadInitialData();
@@ -143,9 +179,131 @@ export default function App() {
       });
       // A dedicated effect below will spot this and re-evaluate the predictions!
     }
+
+    fetchIntradayFiles();
   };
 
+  const fetchIntradayFiles = async () => {
+    try {
+      const res = await fetch('/api/intraday-files');
+      if (res.ok) {
+        const files = await res.json();
+        setIntradayFiles(files);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
+  const fetchIntradayData = async (ticker) => {
+    try {
+      const res = await fetch(`/api/intraday-data?ticker=${ticker}`);
+      if (res.ok) {
+        const data = await res.json();
+        return data.map(day => ({ ...day, ticker }));
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    return [];
+  };
+
+  const ensureIntradayData = async (ticker) => {
+    setIsIntradayLoading(true);
+    let currentData = { ...intradayData };
+    if (ticker === 'ALL') {
+      for (const f of intradayFiles) {
+        if (!currentData[f.ticker]) {
+          currentData[f.ticker] = await fetchIntradayData(f.ticker);
+        }
+      }
+    } else {
+      if (!currentData[ticker]) {
+        currentData[ticker] = await fetchIntradayData(ticker);
+      }
+    }
+    setIntradayData(currentData);
+    setIsIntradayLoading(false);
+  };
+
+  const volumeProfileDisplayData = useMemo(() => {
+    if (!intradayData || Object.keys(intradayData).length === 0) return [];
+
+    let keysToUse = [];
+    if (selectedIntradayTicker === 'ALL') {
+      keysToUse = Object.keys(intradayData);
+    } else {
+      if (intradayData[selectedIntradayTicker]) {
+        keysToUse = [selectedIntradayTicker];
+      }
+    }
+
+    const timeMap = {};
+    for (const key of keysToUse) {
+      const days = intradayData[key];
+      if (!days) continue;
+      for (const day of days) {
+        if (!day.bars || day.totalVolume <= 0) continue;
+        for (const bar of day.bars) {
+          if (!timeMap[bar.time]) {
+            timeMap[bar.time] = { time: bar.time, totalFraction: 0, count: 0 };
+          }
+          timeMap[bar.time].totalFraction += (bar.volume / day.totalVolume);
+          timeMap[bar.time].count += 1;
+        }
+      }
+    }
+
+    const profile = Object.values(timeMap).map(t => ({
+      time: t.time.substring(0, 5),
+      avgFraction: t.count > 0 ? t.totalFraction / t.count : 0
+    }));
+
+    profile.sort((a, b) => a.time.localeCompare(b.time));
+
+    const sumFrac = profile.reduce((acc, p) => acc + p.avgFraction, 0);
+    if (sumFrac > 0) {
+      profile.forEach(p => p.avgFraction = p.avgFraction / sumFrac);
+    }
+
+    // Now compute prediction based on user INTRADAY ACTUAL VOLUME input
+    let base = profile.map(p => ({ ...p, predictedVolume: null, predictedVisual: null }));
+    if (!manualIntradayInputStr) return { chart: base, mathProjectedVol: null };
+
+    const parts = manualIntradayInputStr.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n) && n >= 0);
+    if (parts.length === 0) return { chart: base, mathProjectedVol: null };
+
+    let inputSum = 0;
+    let baseFracSum = 0;
+    for (let i = 0; i < parts.length; i++) {
+      if (base[i]) {
+        base[i].predictedVolume = parts[i];
+        base[i].predictedVisual = parts[i];
+        inputSum += parts[i];
+        baseFracSum += base[i].avgFraction;
+      } else break;
+    }
+
+    let mathProjectedVol = null;
+    if (baseFracSum > 0) {
+      mathProjectedVol = inputSum / baseFracSum;
+    }
+
+    if (parts.length < base.length && parts.length > 0 && mathProjectedVol > 0) {
+      for (let i = parts.length; i < base.length; i++) {
+        base[i].predictedVolume = base[i].avgFraction * mathProjectedVol;
+        base[i].predictedVisual = base[i].predictedVolume;
+      }
+    }
+
+    // Assign scaled average representation across all bars so chart comparisons are visible
+    const visualScale = mathProjectedVol > 0 ? mathProjectedVol : (inputSum > 0 ? inputSum * 10 : 1000000);
+    base.forEach(b => {
+      b.scaledAvgVolume = b.avgFraction * visualScale;
+    });
+
+    return { chart: base, mathProjectedVol };
+  }, [intradayData, selectedIntradayTicker, manualIntradayInputStr]);
 
   // The Fetch wrapper: Hits backend directly, throws error if backend fails
   const fetchRawTickerData = async (ticker) => {
@@ -369,6 +527,229 @@ export default function App() {
     }
   };
 
+  // Intraday Handlers
+  const handleTrainIntraday = async () => {
+    await ensureIntradayData(selectedIntradayTicker);
+
+    // Make sure the daily data is available for those tickers so we have avgVol
+    const tickersToEnsure = selectedIntradayTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedIntradayTicker];
+    for (const ticker of tickersToEnsure) {
+      if (!rawMarketData[ticker]) {
+        const daily = await fetchRawTickerData(ticker);
+        setRawMarketData(prev => ({ ...prev, [ticker]: daily }));
+      }
+    }
+
+    setIsIntradayTraining(true);
+    setIntradayAiResults(null);
+    setManualIntradayResult(null);
+
+    try {
+      // Because rawMarketData updates async, `processedData` might not immediately reflect the fetched data if we used setRawMarketData just now.
+      // However for safety, it'll use what's already built. If it wasn't loaded, user can click Train again. (Or we enforce ALL fetching upfront when they click 'ALL')
+      let intradayListToUse = [];
+      if (selectedIntradayTicker === 'ALL') {
+        for (const key of Object.keys(intradayData)) {
+          if (intradayData[key]) intradayListToUse = intradayListToUse.concat(intradayData[key]);
+        }
+      } else {
+        intradayListToUse = intradayData[selectedIntradayTicker] || [];
+      }
+
+      const dailyDataToUse = processedData;
+
+      const results = await runIntradayTfjsPipeline(
+        intradayListToUse,
+        dailyDataToUse,
+        minutesToUse,
+        50,
+        (epoch, total, loss) => {
+          setIntradayTrainEpoch(epoch);
+          setIntradayTrainLoss(loss);
+        }
+      );
+      setIntradayAiResults(results);
+    } catch (err) {
+      console.error("Intraday AI Training Error", err);
+    }
+    setIsIntradayTraining(false);
+  };
+
+  const handlePredictIntraday = async () => {
+    if (!intradayAiResults || !intradayAiResults.model) {
+      alert("Please click 'Train Prediction Model' first so the AI can analyze your data before it makes predictions!");
+      return;
+    }
+
+    const parts = manualIntradayInputStr.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+    const expectedBars = Math.floor(minutesToUse / 5);
+
+    if (parts.length !== expectedBars) {
+      alert(`The AI Model was trained on the first ${minutesToUse} minutes of the day (${expectedBars} bars).\nPlease enter exactly ${expectedBars} comma-separated actual volume values!`);
+      return;
+    }
+
+    const fallbacks = processedData.filter(d => true);
+
+    // Find the right historical Average Volume to map fraction predictions into real shares
+    const isIndividualStock = selectedIntradayTicker !== 'ALL';
+    const tickerToFind = isIndividualStock ? selectedIntradayTicker : (selectedTickerFilter !== 'ALL' ? selectedTickerFilter : null);
+
+    let avgVolFallback = 1000000;
+    if (tickerToFind) {
+      const match = processedData.filter(d => d.ticker === tickerToFind);
+      if (match.length > 0) avgVolFallback = match[match.length - 1].avgVol;
+    } else {
+      if (fallbacks.length > 0) avgVolFallback = fallbacks[fallbacks.length - 1].avgVol;
+    }
+
+    try {
+      const res = await evaluateIntradayModel(intradayAiResults.model, intradayAiResults.preparedData, parts, avgVolFallback);
+      setManualIntradayResult({
+        rvol: res,
+        predictedVolume: res * avgVolFallback,
+        showRvol: !!tickerToFind
+      });
+    } catch (e) {
+      console.error(e);
+      alert("Error evaluating model.");
+    }
+  };
+
+  // --- MAX EXCURSION HANDLERS ---
+  const fetchDailyFeatures = async (ticker) => {
+    try {
+      const res = await fetch(`/api/intraday-features?ticker=${ticker}`);
+      if (res.ok) return await res.json();
+    } catch (e) {
+      console.error(e);
+    }
+    return [];
+  };
+
+  const handleTrainMaxExcursion = async () => {
+    await ensureIntradayData(selectedMaxExcTicker);
+
+    const tickersToUse = selectedMaxExcTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedMaxExcTicker];
+
+    // Ensure daily data and features for all tickers
+    setIsMaxExcTraining(true);
+    setMaxExcResults(null);
+    setMaxExcSensitivity(null);
+    setMaxExcPrediction(null);
+
+    try {
+      // Fetch daily features for each ticker
+      const updatedFeatures = { ...maxExcDailyFeatures };
+      for (const ticker of tickersToUse) {
+        if (!updatedFeatures[ticker]) {
+          updatedFeatures[ticker] = await fetchDailyFeatures(ticker);
+        }
+        if (!rawMarketData[ticker]) {
+          const daily = await fetchRawTickerData(ticker);
+          setRawMarketData(prev => ({ ...prev, [ticker]: daily }));
+        }
+      }
+      setMaxExcDailyFeatures(updatedFeatures);
+
+      // Collect all intraday data
+      let allIntraday = [];
+      let allFeatures = [];
+      for (const ticker of tickersToUse) {
+        const days = intradayData[ticker] || [];
+        allIntraday = allIntraday.concat(days.map(d => ({ ...d, ticker })));
+        allFeatures = allFeatures.concat(updatedFeatures[ticker] || []);
+      }
+
+      const results = await runMaxExcursionPipeline(
+        allIntraday,
+        allFeatures,
+        maxExcMinutes,
+        maxExcTotalEpochs,
+        (epoch, total, loss) => {
+          setMaxExcTrainEpoch(epoch);
+          setMaxExcTotalEpochs(total);
+          setMaxExcTrainLoss(loss);
+        },
+        enabledFeatures
+      );
+      setMaxExcResults(results);
+    } catch (err) {
+      console.error('Max Excursion Training Error', err);
+    }
+    setIsMaxExcTraining(false);
+  };
+
+  const handleRunSensitivity = async () => {
+    if (!maxExcResults || !maxExcResults.model || !maxExcResults.preparedData) return;
+    setIsRunningSensitivity(true);
+    try {
+      const results = await runSensitivityAnalysis(maxExcResults.model, maxExcResults.preparedData);
+      setMaxExcSensitivity(results);
+    } catch (err) {
+      console.error('Sensitivity Analysis Error', err);
+    }
+    setIsRunningSensitivity(false);
+  };
+
+  const handleManualMaxExcPrediction = async () => {
+    if (!maxExcResults || !maxExcResults.model || !maxExcResults.preparedData) {
+      alert('Please train the model first!');
+      return;
+    }
+    const openPrice = parseFloat(manualMaxExcInput.open);
+    const volume = parseFloat(manualMaxExcInput.volume);
+    if (isNaN(openPrice) || isNaN(volume) || openPrice <= 0) {
+      alert('Please enter valid open price and volume.');
+      return;
+    }
+
+    // Get the latest features for the selected ticker
+    const ticker = selectedMaxExcTicker !== 'ALL' ? selectedMaxExcTicker : (intradayFiles.length > 0 ? intradayFiles[0].ticker : null);
+    if (!ticker) return;
+
+    const features = maxExcDailyFeatures[ticker];
+    if (!features || features.length === 0) return;
+    const latestFeat = features[features.length - 1];
+
+    const avgVol = latestFeat.avgVol50 || 1000000;
+    const projectedRVol = (volume * 78) / avgVol;
+    const firstBarVolRatio = volume / avgVol;
+
+    const featureVector = [
+      projectedRVol,
+      latestFeat.prevCloseChange || 0,
+      firstBarVolRatio,
+      0.3, // placeholder early range ratio
+      0,   // placeholder pct above open
+      1,   // placeholder up/down ratio
+      openPrice > 0 ? latestFeat.adr20 / openPrice : 0,
+      openPrice > 0 ? latestFeat.atr14 / openPrice : 0,
+      latestFeat.atrDistEma10 || 0,
+      latestFeat.atrDistEma20 || 0,
+      latestFeat.atrDistEma50 || 0
+    ];
+
+    try {
+      const exc = await predictMaxExcursion(
+        maxExcResults.model,
+        maxExcResults.preparedData.normParams,
+        featureVector,
+        maxExcResults.preparedData.activeIndices
+      );
+      const adr = latestFeat.adr20 || 1;
+      setMaxExcPrediction({
+        excursionAdr: exc,
+        predictedHigh: openPrice + exc * adr,
+        predictedLow: openPrice - exc * adr,
+        adr,
+        projectedRVol
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // Generate Advanced Statistical Analysis
   const advancedStats = useMemo(() => {
     const thresholds = [1.5, 2.0, 2.5, 3.0];
@@ -429,6 +810,28 @@ export default function App() {
       avgExcursion: avgExcursion.toFixed(2),
     };
   }, [chartData, customRvolThreshold]);
+
+  const aiRegressionResult = useMemo(() => {
+    if (!intradayAiResults || !intradayAiResults.predictionsMap) return null;
+    const points = intradayAiResults.predictionsMap.map(p => ({ x: p.actualVol, y: p.predictedVol }));
+    const fit = findBestFitRegression(points, 4, 1, false);
+    if (!fit) return null;
+
+    // Create smoothly sorted line points
+    const maxX = Math.max(...points.map(p => p.x));
+    const step = maxX / 50;
+    const lineData = [];
+    for (let i = 0; i <= 50; i++) {
+      let x = i * step;
+      lineData.push({
+        actualVol: x,
+        regressionVol: fit.predict(x)
+      });
+    }
+    return { fit, lineData };
+  }, [intradayAiResults]);
+
+  // Handle Loading State
 
   // Calculate RVol Distribution for Bell Curve
   const { rvolDistributionData, rvolStats } = useMemo(() => {
@@ -958,427 +1361,1094 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 p-4 md:p-8 font-sans text-slate-800">
       <div className="max-w-6xl mx-auto space-y-6">
 
-        {/* Header & Controls */}
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+        {/* Header & Tabs */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">Intraday Excursion vs Volume Dashboard</h1>
+            <h1 className="text-2xl font-bold text-slate-900">Stock Stats & ML Predictors</h1>
             <p className="text-sm text-slate-500 mt-1">
-              Analyzing `Max Abs(High-Open, Low-Open) / ADR$` mathematically regressed against RVol.
+              Data-driven edge leveraging regressions and neural networks.
             </p>
           </div>
 
-          <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 bg-slate-100 p-4 rounded-lg">
-            <form onSubmit={handleAddCustomTicker} className="flex flex-col sm:flex-row items-center gap-3 w-full lg:w-auto">
-              <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">Analyze Ticker:</label>
-              <div className="flex w-full sm:w-auto">
-                <input
-                  type="text"
-                  list="ticker-list"
-                  value={searchInput}
-                  onChange={e => setSearchInput(e.target.value)}
-                  placeholder="e.g. NVDA"
-                  className="bg-white border border-slate-300 text-slate-900 text-sm rounded-l-md focus:ring-blue-500 focus:border-blue-500 block w-full p-2 outline-none uppercase"
-                />
-                <datalist id="ticker-list">
-                  <option value="ALL">ALL TICKERS</option>
-                  {availableTickers.map(t => <option key={t} value={t} />)}
-                </datalist>
-                <button
-                  type="submit"
-                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-r-md transition-colors text-sm"
-                >
-                  Fetch
-                </button>
-              </div>
-              <select
-                value={selectedTickerFilter}
-                onChange={async (e) => {
-                  const val = e.target.value;
-                  // If switching to a ticker (or 'ALL') that doesn't have data fully loaded yet, we should fetch it.
-                  // (Primarily for 'ALL' or other untouched tickers from INITIAL_TICKERS)
-                  if (val === 'ALL') {
-                    setLoading(true);
-                    const newRawData = { ...rawMarketData };
-                    for (const ticker of availableTickers) {
-                      if (!newRawData[ticker]) {
-                        newRawData[ticker] = await fetchRawTickerData(ticker);
-                      }
-                    }
-                    setRawMarketData(newRawData);
-                    setSelectedTickerFilter(val);
-                    setLoading(false);
-                  } else {
-                    if (!rawMarketData[val]) {
-                      setLoading(true);
-                      const data = await fetchRawTickerData(val);
-                      setRawMarketData(prev => ({ ...prev, [val]: data }));
-                      setLoading(false);
-                    }
-                    setSelectedTickerFilter(val);
-                  }
-                }}
-                className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md focus:ring-blue-500 focus:border-blue-500 p-2 cursor-pointer outline-none w-full sm:w-auto"
-              >
-                <option value="ALL">View All Data</option>
-                {availableTickers.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </form>
-
-            <div className="flex flex-col sm:flex-row items-center gap-4 w-full lg:w-auto border-t lg:border-t-0 lg:border-l border-slate-300 pt-4 lg:pt-0 lg:pl-4">
-              <div className="flex items-center space-x-2">
-                <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">RVol Period:</label>
-                <select
-                  value={rvolPeriod}
-                  onChange={e => setRvolPeriod(Number(e.target.value))}
-                  className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
-                >
-                  <option value={10}>10 Days</option>
-                  <option value={20}>20 Days</option>
-                  <option value={50}>50 Days</option>
-                </select>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">ADR Period:</label>
-                <select
-                  value={adrPeriod}
-                  onChange={e => setAdrPeriod(Number(e.target.value))}
-                  className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
-                >
-                  <option value={10}>10 Days</option>
-                  <option value={20}>20 Days</option>
-                  <option value={50}>50 Days</option>
-                </select>
-              </div>
-            </div>
+          <div className="flex border-b border-slate-200 gap-2">
+            <button
+              onClick={() => setActiveTab('daily')}
+              className={`px-4 py-2 font-semibold text-sm ${activeTab === 'daily' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Daily RVol vs Excursion
+            </button>
+            <button
+              onClick={() => setActiveTab('intraday')}
+              className={`px-4 py-2 font-semibold text-sm ${activeTab === 'intraday' ? 'border-b-2 border-purple-600 text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Intraday Volume Predictor
+            </button>
+            <button
+              onClick={() => setActiveTab('maxExcursion')}
+              className={`px-4 py-2 font-semibold text-sm ${activeTab === 'maxExcursion' ? 'border-b-2 border-emerald-600 text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Max Excursion Predictor
+            </button>
           </div>
         </div>
 
-        {/* AI Predictor Controls */}
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h2 className="text-lg font-bold text-slate-800">Neural Network Predictor (LSTM)</h2>
-              <p className="text-xs text-slate-500">Train an AI model directly in your browser to predict Excursion based on sequence history. Saves locally to accelerate future reloads.</p>
-            </div>
+        {/* Existing Content wrapped in activeTab === 'daily' */}
+        {activeTab === 'daily' && (
+          <div className="space-y-6">
+            {/* Header & Controls */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Historical RVol Excursion Dashboard</h2>
+                <p className="text-sm text-slate-500 mt-1">
+                  Analyzing `Max Abs(High-Open, Low-Open) / ADR$` mathematically regressed against RVol.
+                </p>
+              </div>
 
-            <div className="flex flex-col sm:flex-row gap-2">
-              <button
-                onClick={handleTrainAI}
-                disabled={isTrainingAi || chartData.length < 10}
-                className={`py-2 px-4 rounded-md font-semibold text-white transition-colors text-sm ${isTrainingAi ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
-              >
-                {isTrainingAi ? `Training... Epoch ${aiTrainingEpoch}/${aiTotalEpochs}` : 'Train AI'}
-              </button>
-              {aiResults && !isTrainingAi && (
-                <button
-                  onClick={handleDownloadModel}
-                  className="py-2 px-4 rounded-md font-semibold text-purple-700 bg-purple-100 hover:bg-purple-200 transition-colors text-sm border border-purple-300"
-                  title="Export Model to PC"
-                >
-                  Export Model
-                </button>
-              )}
+              <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 bg-slate-100 p-4 rounded-lg">
+                <form onSubmit={handleAddCustomTicker} className="flex flex-col sm:flex-row items-center gap-3 w-full lg:w-auto">
+                  <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">Analyze Ticker:</label>
+                  <div className="flex w-full sm:w-auto">
+                    <input
+                      type="text"
+                      list="ticker-list"
+                      value={searchInput}
+                      onChange={e => setSearchInput(e.target.value)}
+                      placeholder="e.g. NVDA"
+                      className="bg-white border border-slate-300 text-slate-900 text-sm rounded-l-md focus:ring-blue-500 focus:border-blue-500 block w-full p-2 outline-none uppercase"
+                    />
+                    <datalist id="ticker-list">
+                      <option value="ALL">ALL TICKERS</option>
+                      {availableTickers.map(t => <option key={t} value={t} />)}
+                    </datalist>
+                    <button
+                      type="submit"
+                      className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-r-md transition-colors text-sm"
+                    >
+                      Fetch
+                    </button>
+                  </div>
+                  <select
+                    value={selectedTickerFilter}
+                    onChange={async (e) => {
+                      const val = e.target.value;
+                      // If switching to a ticker (or 'ALL') that doesn't have data fully loaded yet, we should fetch it.
+                      // (Primarily for 'ALL' or other untouched tickers from INITIAL_TICKERS)
+                      if (val === 'ALL') {
+                        setLoading(true);
+                        const newRawData = { ...rawMarketData };
+                        for (const ticker of availableTickers) {
+                          if (!newRawData[ticker]) {
+                            newRawData[ticker] = await fetchRawTickerData(ticker);
+                          }
+                        }
+                        setRawMarketData(newRawData);
+                        setSelectedTickerFilter(val);
+                        setLoading(false);
+                      } else {
+                        if (!rawMarketData[val]) {
+                          setLoading(true);
+                          const data = await fetchRawTickerData(val);
+                          setRawMarketData(prev => ({ ...prev, [val]: data }));
+                          setLoading(false);
+                        }
+                        setSelectedTickerFilter(val);
+                      }
+                    }}
+                    className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md focus:ring-blue-500 focus:border-blue-500 p-2 cursor-pointer outline-none w-full sm:w-auto"
+                  >
+                    <option value="ALL">View All Data</option>
+                    {availableTickers.map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </form>
 
-              <div className="relative">
-                <label className="py-2 px-4 rounded-md font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors text-sm border border-slate-300 cursor-pointer block text-center" title="Import previously downloaded model files">
-                  Import
-                  <input type="file" multiple accept=".json,.bin" className="hidden" onChange={handleUploadModel} />
-                </label>
+                <div className="flex flex-col sm:flex-row items-center gap-4 w-full lg:w-auto border-t lg:border-t-0 lg:border-l border-slate-300 pt-4 lg:pt-0 lg:pl-4">
+                  <div className="flex items-center space-x-2">
+                    <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">RVol Period:</label>
+                    <select
+                      value={rvolPeriod}
+                      onChange={e => setRvolPeriod(Number(e.target.value))}
+                      className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
+                    >
+                      <option value={10}>10 Days</option>
+                      <option value={20}>20 Days</option>
+                      <option value={50}>50 Days</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center space-x-2">
+                    <label className="text-sm font-semibold text-slate-700 whitespace-nowrap">ADR Period:</label>
+                    <select
+                      value={adrPeriod}
+                      onChange={e => setAdrPeriod(Number(e.target.value))}
+                      className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md p-2 outline-none cursor-pointer"
+                    >
+                      <option value={10}>10 Days</option>
+                      <option value={20}>20 Days</option>
+                      <option value={50}>50 Days</option>
+                    </select>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
 
-          {isTrainingAi && (
-            <div className="w-full bg-slate-200 rounded-full h-2 mb-1">
-              <div className="bg-purple-600 h-2 rounded-full transition-all duration-300" style={{ width: `${(aiTrainingEpoch / aiTotalEpochs) * 100}%` }}></div>
-              <p className="text-xs text-slate-500 mt-2 text-right">Current Loss: {aiTrainingLoss.toFixed(4)}</p>
-            </div>
-          )}
-
-          {aiResults && !isTrainingAi && (
-            <div className="bg-purple-50 border border-purple-200 p-4 rounded-lg flex flex-col gap-4">
-              <div className="flex flex-col xl:flex-row justify-between xl:items-center gap-4 border-b border-purple-200/50 pb-4">
+            {/* AI Predictor Controls */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
+              <div className="flex justify-between items-center">
                 <div>
-                  <h3 className="font-bold text-purple-900">Training Complete</h3>
-                  <p className="text-xs text-purple-700">LSTM Final Loss: {aiResults.finalLoss.toFixed(4)}</p>
-                  <p className="text-xs text-purple-600 mt-1 font-medium">The AI predictions are now plotted as Purple Diamonds on the chart below.</p>
+                  <h2 className="text-lg font-bold text-slate-800">Neural Network Predictor (LSTM)</h2>
+                  <p className="text-xs text-slate-500">Train an AI model directly in your browser to predict Excursion based on sequence history. Saves locally to accelerate future reloads.</p>
                 </div>
-                <div className="flex gap-4">
-                  <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px]">
-                    <span className="text-xs text-slate-500 font-bold uppercase text-center">Historical Fit (R²)</span>
-                    <span className="text-lg font-mono text-slate-800">{historicalRegression ? historicalRegression.r2.toFixed(4) : 'N/A'}</span>
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <button
+                    onClick={handleTrainAI}
+                    disabled={isTrainingAi || chartData.length < 10}
+                    className={`py-2 px-4 rounded-md font-semibold text-white transition-colors text-sm ${isTrainingAi ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
+                  >
+                    {isTrainingAi ? `Training... Epoch ${aiTrainingEpoch}/${aiTotalEpochs}` : 'Train AI'}
+                  </button>
+                  {aiResults && !isTrainingAi && (
+                    <>
+                      <button
+                        onClick={handleDownloadModel}
+                        className="py-2 px-4 rounded-md font-semibold text-purple-700 bg-purple-100 hover:bg-purple-200 transition-colors text-sm border border-purple-300"
+                        title="Export Model to PC downloads folder"
+                      >
+                        Export Model
+                      </button>
+                      <button
+                        onClick={async () => {
+                          const res = await saveModelToServer(aiResults.model, aiResults.preparedData, 'daily');
+                          if (res.success) alert("Model saved directly to project folder!");
+                          else alert("Error saving: " + res.error);
+                        }}
+                        className="py-2 px-4 rounded-md font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors text-sm border border-indigo-700"
+                        title="Save directly to Node.js backend"
+                      >
+                        Save Model to App
+                      </button>
+                    </>
+                  )}
+
+                  <div className="relative">
+                    <label className="py-2 px-4 rounded-md font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors text-sm border border-slate-300 cursor-pointer block text-center" title="Import previously downloaded model files">
+                      Import
+                      <input type="file" multiple accept=".json,.bin" className="hidden" onChange={handleUploadModel} />
+                    </label>
                   </div>
-                  <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px] border-b-2 border-purple-500 relative flex-shrink-0">
-                    <span className="text-xs text-slate-500 font-bold uppercase text-center">AI Fit (R²)</span>
-                    <span className="text-lg font-mono text-purple-700 font-semibold">{aiRegression ? aiRegression.r2.toFixed(4) : 'N/A'}</span>
-                    {historicalRegression && aiRegression && aiRegression.r2 > historicalRegression.r2 && (
-                      <div className="absolute -top-2 -right-2 bg-green-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow">WINS</div>
+                </div>
+              </div>
+
+              {isTrainingAi && (
+                <div className="w-full bg-slate-200 rounded-full h-2 mb-1">
+                  <div className="bg-purple-600 h-2 rounded-full transition-all duration-300" style={{ width: `${(aiTrainingEpoch / aiTotalEpochs) * 100}%` }}></div>
+                  <p className="text-xs text-slate-500 mt-2 text-right">Current Loss: {aiTrainingLoss.toFixed(4)}</p>
+                </div>
+              )}
+
+              {aiResults && !isTrainingAi && (
+                <div className="bg-purple-50 border border-purple-200 p-4 rounded-lg flex flex-col gap-4">
+                  <div className="flex flex-col xl:flex-row justify-between xl:items-center gap-4 border-b border-purple-200/50 pb-4">
+                    <div>
+                      <h3 className="font-bold text-purple-900">Training Complete</h3>
+                      <p className="text-xs text-purple-700">LSTM Final Loss: {aiResults.finalLoss.toFixed(4)}</p>
+                      <p className="text-xs text-purple-600 mt-1 font-medium">The AI predictions are now plotted as Purple Diamonds on the chart below.</p>
+                    </div>
+                    <div className="flex gap-4">
+                      <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px]">
+                        <span className="text-xs text-slate-500 font-bold uppercase text-center">Historical Fit (R²)</span>
+                        <span className="text-lg font-mono text-slate-800">{historicalRegression ? historicalRegression.r2.toFixed(4) : 'N/A'}</span>
+                      </div>
+                      <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px] border-b-2 border-purple-500 relative flex-shrink-0">
+                        <span className="text-xs text-slate-500 font-bold uppercase text-center">AI Fit (R²)</span>
+                        <span className="text-lg font-mono text-purple-700 font-semibold">{aiRegression ? aiRegression.r2.toFixed(4) : 'N/A'}</span>
+                        {historicalRegression && aiRegression && aiRegression.r2 > historicalRegression.r2 && (
+                          <div className="absolute -top-2 -right-2 bg-green-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow">WINS</div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Manual Inference Predictor Panel */}
+                  <div className="pt-2 flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                    <div className="flex-1">
+                      <p className="text-sm font-bold text-purple-900">Manual AI Prediction</p>
+                      <p className="text-xs text-purple-700">Ask the trained Neural Network directly. Input a hypothetical RVol scenario for today to see its prediction.</p>
+                    </div>
+                    <div className="flex items-center shadow-sm rounded-md overflow-hidden border border-purple-300 w-full sm:w-auto">
+                      <div className="bg-purple-100 text-purple-800 px-3 py-2 text-xs font-bold border-r border-purple-200 uppercase tracking-wide flex-shrink-0">
+                        Input RVol
+                      </div>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        value={manualAiInput}
+                        onChange={e => setManualAiInput(e.target.value)}
+                        className="w-24 px-3 py-2 outline-none font-bold text-slate-800 flex-shrink-0"
+                      />
+                      <button
+                        onClick={handleManualPrediction}
+                        className="bg-purple-600 hover:bg-purple-700 text-white transition-colors px-4 py-2 text-sm font-bold flex-shrink-0 border-l border-purple-700"
+                      >
+                        Predict
+                      </button>
+                    </div>
+                    {manualAiResult !== null && (
+                      <div className="bg-white border-2 border-amber-400 p-2 rounded-md shadow-sm ml-auto text-center flex-shrink-0 min-w-[120px]">
+                        <span className="block text-[10px] uppercase font-bold text-slate-500">LSTM Output</span>
+                        <span className="block text-lg font-black text-slate-800">{manualAiResult.toFixed(2)}x <span className="text-xs text-slate-500 font-normal">ADR</span></span>
+                      </div>
                     )}
                   </div>
                 </div>
+              )}
+            </div>
+
+            {/* Main Visualization */}
+            {marginalPlotState && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-end">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-800">Scatter Plot with Probability Distributions</h2>
+                    <p className="text-xs text-slate-500">Y-Axis: Absolute Max Excursion Multiple. X-Axis: Relative Volume.</p>
+                  </div>
+                  {historicalRegression && (
+                    <div className="mt-2 sm:mt-0 bg-blue-50 border border-blue-200 text-blue-800 text-xs px-3 py-1 rounded-full font-semibold">
+                      <span className="mr-2">Historical Fit ({historicalRegression.type}):</span>
+                      <span className="font-mono">{historicalRegression.equation}</span>
+                    </div>
+                  )}
+                  {aiRegression && (
+                    <div className="mt-2 sm:mt-0 bg-purple-50 border border-purple-200 text-purple-800 text-xs px-3 py-1 rounded-full font-semibold ml-2">
+                      <span className="mr-2">AI Fit ({aiRegression.type}):</span>
+                      <span className="font-mono">{aiRegression.equation}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="h-[600px] w-full">
+                  <Plot
+                    data={marginalPlotState.traces}
+                    layout={marginalPlotState.layout}
+                    useResizeHandler={true}
+                    style={{ width: '100%', height: '100%' }}
+                    config={{ displayModeBar: false }}
+                  />
+                </div>
+              </div>
+            )}
+
+
+            {/* Advanced Statistical Analysis: High Excursion Probabilities */}
+            {advancedStats.length > 0 && (
+              <div className="bg-white border border-slate-200 rounded-xl shadow-sm mt-6 overflow-hidden">
+                <div className="bg-slate-50 border-b border-slate-200 p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                  <div>
+                    <h3 className="text-md font-bold text-slate-800">Advanced High-Excursion Probabilities</h3>
+                    <p className="text-xs text-slate-500 mt-1">Historically analyzing the percentage of days that push a <strong>High Excursion (&ge; 1.5 ADR)</strong> once an RVol threshold is breached.</p>
+                  </div>
+                  <div className="bg-white border border-green-200 rounded-lg shadow-sm p-3 flex items-center space-x-3 whitespace-nowrap">
+                    <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center flex-shrink-0">
+                      <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                    </div>
+                    <div>
+                      <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Total Data in Green Zone</div>
+                      <div className="text-xl font-bold text-green-700">
+                        {advancedStats.find(s => s.threshold === '1.5')?.overallFrequency || '0.00'}%
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {advancedStats.map((stat, idx) => (
+                    <div key={idx} className="bg-slate-50 rounded-lg p-4 border border-slate-100 flex flex-col justify-between">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">RVol threshold</div>
+                        <div className="text-lg font-bold text-slate-800 bg-white border border-slate-200 inline-block px-2 py-1 rounded shadow-sm">
+                          &ge; {stat.threshold}x
+                        </div>
+                      </div>
+
+                      <div className="mt-4">
+                        <div className="flex justify-between items-end mb-1">
+                          <span className="text-sm font-medium text-slate-700">Green Zone Rate:</span>
+                          <span className="text-xl font-bold text-green-600">{stat.probability}%</span>
+                        </div>
+                        <div className="w-full bg-slate-200 rounded-full h-1.5 mb-3">
+                          <div className="bg-green-500 h-1.5 rounded-full" style={{ width: `${stat.probability}%` }}></div>
+                        </div>
+
+                        <div className="flex justify-between text-xs text-slate-500 mb-1">
+                          <span>Total Signal Days:</span>
+                          <span className="font-semibold text-slate-700">{stat.totalMatchingDays}</span>
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-500 mb-1">
+                          <span>High Excursion Hits:</span>
+                          <span className="font-semibold text-green-700">{stat.highExcursionDays}</span>
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-500 mb-1">
+                          <span>Avg. Excursion for Group:</span>
+                          <span className="font-semibold text-blue-600">{stat.avgExcursion}x</span>
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-500 pt-2 mt-2 border-t border-slate-200">
+                          <span>Overall Frequency:</span>
+                          <span className="font-semibold">{stat.overallFrequency}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Custom RVol Input Block */}
+                <div className="bg-blue-50/50 border-t border-slate-200 p-4 sm:p-6">
+                  <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center justify-between">
+                    <div className="flex-1">
+                      <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                        <svg className="w-5 h-5 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
+                        Custom RVol Green Zone Calculator
+                      </h4>
+                      <p className="text-xs text-slate-600 mt-1">
+                        Enter a specific minimum Relative Volume (RVol) across your datasets to calculate its historical probability of reaching a <span className="font-semibold text-green-700">1.5x+ ADR</span> Excursion.
+                      </p>
+                    </div>
+
+                    <div className="flex items-stretch bg-white border border-blue-200 shadow-sm rounded-lg overflow-hidden w-full lg:w-auto">
+                      <div className="px-4 py-3 bg-slate-50 border-r border-blue-100 flex items-center justify-center">
+                        <span className="text-xs font-bold text-slate-500 tracking-wider">RVOL &ge;</span>
+                      </div>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        placeholder="e.g. 1.5"
+                        className="w-24 px-3 py-2 outline-none text-slate-800 font-bold focus:bg-blue-50 transition-colors"
+                        value={customRvolThreshold}
+                        onChange={(e) => setCustomRvolThreshold(e.target.value)}
+                      />
+                      <div className="flex-1 px-4 py-3 bg-blue-600 text-white flex items-center justify-between gap-4 min-w-[140px]">
+                        <div className="flex flex-col">
+                          <span className="text-[10px] uppercase font-semibold text-blue-200 tracking-wider leading-none mb-1">Green Zone Rate</span>
+                          <span className="text-2xl font-bold leading-none">{customStat ? customStat.probability : '0.00'}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {customStat && !isNaN(parseFloat(customRvolThreshold)) && (
+                    <div className="mt-4 pt-4 border-t border-blue-200/50 flex flex-wrap gap-x-6 gap-y-2 text-xs">
+                      <div className="flex flex-col">
+                        <span className="text-slate-500">Total Signal Days</span>
+                        <span className="font-semibold text-slate-800">{customStat.totalMatchingDays}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-slate-500">High Excursion Hits</span>
+                        <span className="font-semibold text-green-700">{customStat.highExcursionDays}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-slate-500">Avg. Group Excursion</span>
+                        <span className="font-semibold text-blue-700">{customStat.avgExcursion}x</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-slate-500">Overall Frequency</span>
+                        <span className="font-semibold text-slate-800">{customStat.overallFrequency}%</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}        {/* Statistical Summary Table Moved Below Chart */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mt-6">
+              <div className="p-6 border-b border-slate-200">
+                <h2 className="text-lg font-bold text-slate-800">Intraday Excursion by RVol Bucket</h2>
+                <p className="text-xs text-slate-500">Grouped analysis showing the mathematical expansion from the day's open to the high or low.</p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left text-slate-600">
+                  <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
+                    <tr>
+                      <th scope="col" className="px-6 py-4 font-bold">RVol Bucket</th>
+                      <th scope="col" className="px-6 py-4 text-center">Sample Size</th>
+                      <th scope="col" className="px-6 py-4 text-center">RVol Prob.</th>
+                      <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Median Max Exc.</th>
+                      <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">&ge; Median Exc Prob.</th>
+                      <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Mean Max Exc.</th>
+                      <th scope="col" className="px-6 py-4 text-right font-bold text-slate-800 whitespace-nowrap">Absolute Max Exc.</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summaryStats.map((row, idx) => (
+                      <tr key={idx} className="bg-white border-b hover:bg-slate-50 transition-colors">
+                        <td className="px-6 py-4 font-semibold text-slate-900 whitespace-nowrap">
+                          {row.label}
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <span className="bg-slate-100 text-slate-700 py-1 px-3 rounded-full text-xs font-medium">
+                            {row.sampleSize}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 text-center text-slate-500 font-medium">
+                          {row.sampleSize > 0 ? `${row.rvolProbability}%` : '-'}
+                        </td>
+                        <td className="px-6 py-4 text-right font-medium">{row.medianExcursion ? `${row.medianExcursion}x` : '-'}</td>
+                        <td className="px-6 py-4 text-right text-slate-500 font-medium whitespace-nowrap" title={`Probability of any day having an excursion of >= ${row.medianExcursion}x`}>
+                          {row.medianExcursionProb && row.sampleSize > 0 ? `${row.medianExcursionProb}%` : '-'}
+                        </td>
+                        <td className="px-6 py-4 text-right">{row.meanExcursion ? `${row.meanExcursion}x` : '-'}</td>
+                        <td className="px-6 py-4 text-right text-red-600 font-bold">{row.maxExcursion ? `${row.maxExcursion}x` : '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Selected Ticker Stock Chart */}
+            {selectedTickerFilter !== 'ALL' && apexChartState && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mt-6">
+                <div className="mb-4">
+                  <h2 className="text-lg font-bold text-slate-800">{selectedTickerFilter} Historical Chart (Last 6 Months)</h2>
+                  <p className="text-xs text-slate-500">
+                    Daily Candlesticks, Moving Averages (10, 20, 50 EMA), and Volume
+                  </p>
+                </div>
+                <div className="w-full flex flex-col">
+                  <ReactApexChart
+                    options={apexChartState.priceOptions}
+                    series={apexChartState.priceSeries}
+                    type="line"
+                    height={600}
+                  />
+                  <ReactApexChart
+                    options={apexChartState.volumeOptions}
+                    series={apexChartState.volumeSeries}
+                    type="bar"
+                    height={160}
+                  />
+                </div>
+              </div>
+            )}
+
+
+          </div>
+        )}
+
+        {/* Intraday Tab Content */}
+        {activeTab === 'intraday' && (
+          <div className="flex flex-col gap-6">
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Intraday LSTM Network</h2>
+                <p className="text-sm text-slate-500">Train an AI to predict full-day RVol based on the first few minutes of volume after market open.</p>
               </div>
 
-              {/* Manual Inference Predictor Panel */}
-              <div className="pt-2 flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                <div className="flex-1">
-                  <p className="text-sm font-bold text-purple-900">Manual AI Prediction</p>
-                  <p className="text-xs text-purple-700">Ask the trained Neural Network directly. Input a hypothetical RVol scenario for today to see its prediction.</p>
-                </div>
-                <div className="flex items-center shadow-sm rounded-md overflow-hidden border border-purple-300 w-full sm:w-auto">
-                  <div className="bg-purple-100 text-purple-800 px-3 py-2 text-xs font-bold border-r border-purple-200 uppercase tracking-wide flex-shrink-0">
-                    Input RVol
-                  </div>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    value={manualAiInput}
-                    onChange={e => setManualAiInput(e.target.value)}
-                    className="w-24 px-3 py-2 outline-none font-bold text-slate-800 flex-shrink-0"
-                  />
-                  <button
-                    onClick={handleManualPrediction}
-                    className="bg-purple-600 hover:bg-purple-700 text-white transition-colors px-4 py-2 text-sm font-bold flex-shrink-0 border-l border-purple-700"
+              <div className="flex flex-col md:flex-row gap-4 items-end bg-slate-100 p-4 rounded-lg border border-slate-200">
+                <div className="flex flex-col w-full md:w-1/3">
+                  <label className="text-sm font-semibold text-slate-700 mb-2">Analysis Scope (Ticker):</label>
+                  <select
+                    value={selectedIntradayTicker}
+                    onChange={e => setSelectedIntradayTicker(e.target.value)}
+                    className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md focus:ring-purple-500 focus:border-purple-500 p-2 cursor-pointer outline-none w-full"
                   >
-                    Predict
-                  </button>
+                    <option value="ALL">All Tickers ({intradayFiles.length} files)</option>
+                    {intradayFiles.map(f => <option key={f.ticker} value={f.ticker}>{f.ticker} ({f.startDate} to {f.endDate})</option>)}
+                  </select>
+                  {selectedIntradayTicker !== 'ALL' && intradayFiles.find(f => f.ticker === selectedIntradayTicker) && (
+                    <p className="text-xs text-slate-500 mt-2">
+                      Data from {intradayFiles.find(f => f.ticker === selectedIntradayTicker).startDate} to {intradayFiles.find(f => f.ticker === selectedIntradayTicker).endDate}
+                    </p>
+                  )}
                 </div>
-                {manualAiResult !== null && (
-                  <div className="bg-white border-2 border-amber-400 p-2 rounded-md shadow-sm ml-auto text-center flex-shrink-0 min-w-[120px]">
-                    <span className="block text-[10px] uppercase font-bold text-slate-500">LSTM Output</span>
-                    <span className="block text-lg font-black text-slate-800">{manualAiResult.toFixed(2)}x <span className="text-xs text-slate-500 font-normal">ADR</span></span>
+
+                <div className="flex flex-col w-full md:w-1/3">
+                  <label className="text-sm font-semibold text-slate-700 mb-2 flex justify-between">
+                    <span>Minutes after open:</span>
+                    <span className="text-purple-600 bg-purple-100 px-2 py-0.5 rounded font-bold">{minutesToUse} mins</span>
+                  </label>
+                  <input
+                    type="range"
+                    min="5"
+                    max="120"
+                    step="5"
+                    value={minutesToUse}
+                    onChange={e => setMinutesToUse(Number(e.target.value))}
+                    className="w-full h-2 bg-slate-300 rounded-lg appearance-none cursor-pointer mt-2"
+                  />
+                  <p className="text-xs text-slate-500 mt-2 text-center">Using first {Math.floor(minutesToUse / 5)}x 5-min bars</p>
+                </div>
+
+                <div className="w-full md:w-auto ml-auto">
+                  <button
+                    onClick={handleTrainIntraday}
+                    disabled={isIntradayTraining || isIntradayLoading}
+                    className={`py-2 px-6 rounded-md font-bold text-white transition-colors w-full md:w-auto whitespace-nowrap shadow-sm ${isIntradayTraining || isIntradayLoading ? 'bg-slate-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
+                  >
+                    {isIntradayLoading ? 'Loading Data...' : isIntradayTraining ? `Training... Epoch ${intradayTrainEpoch}/50` : 'Train Prediction Model'}
+                  </button>
+                  {isIntradayTraining && (
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 mt-2">
+                      <div className="bg-purple-600 h-1.5 rounded-full transition-all duration-300" style={{ width: `${(intradayTrainEpoch / 50) * 100}%` }}></div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Volume Profile visualization */}
+            {volumeProfileDisplayData.chart && volumeProfileDisplayData.chart.length > 0 && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
+                <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4">
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-800">Unified Prediction: U-Shape vs AI Expected Volume</h3>
+                    <p className="text-sm text-slate-500">Input exact actual bar volumes for the first {minutesToUse} minutes to see algorithmic divergence.</p>
+                  </div>
+                  <div className="flex flex-col sm:flex-row items-stretch shadow-sm rounded-md overflow-hidden border border-purple-300 w-full xl:w-auto flex-shrink-0">
+                    <div className="bg-purple-100 text-purple-800 px-3 py-2 text-xs font-bold border-r border-purple-200 uppercase tracking-wide flex items-center justify-center whitespace-nowrap">
+                      Actual Volumes
+                    </div>
+                    <input
+                      type="text"
+                      value={manualIntradayInputStr}
+                      onChange={e => setManualIntradayInputStr(e.target.value)}
+                      placeholder="e.g. 500000, 200000..."
+                      className="w-full xl:w-64 px-3 py-2 outline-none font-medium text-sm text-slate-800 border-b sm:border-b-0 sm:border-r border-purple-200"
+                    />
+                    <button
+                      onClick={handlePredictIntraday}
+                      className="bg-purple-600 hover:bg-purple-700 text-white font-bold px-6 py-2 text-sm transition-colors whitespace-nowrap"
+                    >
+                      AI Predict RVol
+                    </button>
+                  </div>
+                </div>
+
+                {/* Advanced Prediction Comparison Box */}
+                {(volumeProfileDisplayData.mathProjectedVol > 0 || manualIntradayResult !== null) && (
+                  <div className="flex flex-col md:flex-row gap-4 my-2">
+                    {volumeProfileDisplayData.mathProjectedVol > 0 && (
+                      <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-lg flex-1">
+                        <span className="block text-xs font-bold text-indigo-700 uppercase mb-1">Mathematical U-Shape Projection</span>
+                        <div className="text-2xl font-black text-indigo-900 border-b border-indigo-200 pb-1 mb-1">
+                          {Math.floor(volumeProfileDisplayData.mathProjectedVol).toLocaleString()} <span className="text-sm font-semibold text-indigo-600">Total Shares</span>
+                        </div>
+                        <p className="text-xs text-indigo-800">Assumes today obeys identical relative participation proportions to historical market averages.</p>
+                      </div>
+                    )}
+                    {manualIntradayResult !== null && (
+                      <div className="bg-green-50 border border-green-200 p-4 rounded-lg flex-1">
+                        <span className="block text-xs font-bold text-green-700 uppercase mb-1">Neural Network AI Projection</span>
+                        <div className="text-2xl font-black text-green-700 border-b border-green-200 pb-1 mb-1 space-x-2">
+                          <span>{Math.floor(manualIntradayResult.predictedVolume).toLocaleString()}</span>
+                          <span className="text-sm font-semibold text-green-600">Total Shares</span>
+                          {manualIntradayResult.showRvol && (
+                            <span className="text-lg text-green-800 font-bold bg-green-200 px-2 py-0.5 rounded-md ml-2">{manualIntradayResult.rvol.toFixed(2)}x RVol</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-green-800">Model recognizes volume velocity sequence and predicts statistically probable momentum exhaustion.</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="h-[250px] w-full mt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={volumeProfileDisplayData.chart} margin={{ top: 20, right: 30, left: 10, bottom: 20 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={{ fontSize: 10, fill: '#64748b' }}
+                        minTickGap={30}
+                      >
+                        <Label value="Time of Day" offset={-15} position="insideBottom" style={{ fill: '#64748b', fontWeight: 'bold' }} />
+                      </XAxis>
+                      <YAxis
+                        tickFormatter={(val) => (val > 1000000 ? `${(val / 1000000).toFixed(1)}M` : val > 1000 ? `${(val / 1000).toFixed(0)}k` : val)}
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                      >
+                        <Label value="Projected Volume" angle={-90} position="insideLeft" style={{ fill: '#64748b', fontWeight: 'bold' }} />
+                      </YAxis>
+                      <RechartsTooltip
+                        cursor={{ fill: '#f1f5f9' }}
+                        contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                        formatter={(value, name) => {
+                          if (name === 'Average Historical Pace') return [Math.round(value).toLocaleString(), name];
+                          if (name === 'Projected Trace Overlay') return [Math.round(value).toLocaleString(), name];
+                          return [Math.round(value).toLocaleString(), name];
+                        }}
+                      />
+                      <Legend verticalAlign="top" height={36} />
+                      <Bar dataKey="scaledAvgVolume" fill="#cbd5e1" radius={[2, 2, 0, 0]} name="Average Historical Pace" />
+                      <Line type="monotone" dataKey="predictedVisual" stroke="#a855f7" strokeWidth={3} dot={false} activeDot={{ r: 6 }} name="Projected Trace Overlay" />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {intradayAiResults && !isIntradayTraining && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-100 pb-4">
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-800">Prediction Model Evaluation</h3>
+                    <p className="text-sm text-slate-500">Cross-referencing Expected Volume against Actual End-Of-Day Volume</p>
+                    {aiRegressionResult && aiRegressionResult.fit && (
+                      <p className="text-xs text-amber-600 font-semibold mt-1">
+                        ↳ Best Fit: {aiRegressionResult.fit.type} Regression | R² = {aiRegressionResult.fit.r2.toFixed(3)} | {aiRegressionResult.fit.equation}
+                      </p>
+                    )}
+                  </div>
+                  <div className="mt-4 md:mt-0 flex flex-wrap items-center gap-4">
+                    <button
+                      onClick={async () => {
+                        setIntradaySaveStatus("Saving...");
+                        try {
+                          const res = await saveModelToServer(intradayAiResults.model, intradayAiResults.preparedData, 'intraday');
+                          if (res.success) {
+                            setIntradaySaveStatus("Saved to Intraday Models!");
+                            setTimeout(() => setIntradaySaveStatus(null), 3000);
+                          } else {
+                            setIntradaySaveStatus("Save failed!");
+                          }
+                        } catch (err) {
+                          setIntradaySaveStatus("Save failed!");
+                        }
+                      }}
+                      disabled={!!intradaySaveStatus}
+                      className="py-2 px-4 rounded-md font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 transition-colors text-sm shadow-sm"
+                      title="Save Model to Node.js project folder"
+                    >
+                      {intradaySaveStatus || "Save Model to App"}
+                    </button>
+                    <div className="bg-purple-50 p-3 rounded-lg border border-purple-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-purple-700 font-bold uppercase mb-1">Final Loss (MSE)</span>
+                      <span className="block text-lg font-mono font-bold text-purple-900">{intradayAiResults.finalLoss.toFixed(4)}</span>
+                    </div>
+                    <div className="bg-indigo-50 p-3 rounded-lg border border-indigo-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-indigo-700 font-bold uppercase mb-1">R-Squared (R²)</span>
+                      <span className="block text-lg font-mono font-bold text-indigo-900">{intradayAiResults.rSquared !== undefined ? intradayAiResults.rSquared.toFixed(3) : 'N/A'}</span>
+                    </div>
+                    <div className="bg-blue-50 p-3 rounded-lg border border-blue-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-blue-700 font-bold uppercase mb-1">Standard Dev</span>
+                      <span className="block text-lg font-mono font-bold text-blue-900">
+                        {intradayAiResults.stdDev !== undefined ?
+                          (intradayAiResults.stdDev >= 1000000 ? `±${(intradayAiResults.stdDev / 1000000).toFixed(2)}M` : `±${(intradayAiResults.stdDev / 1000).toFixed(0)}k`)
+                          : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 text-center min-w-[120px]">
+                      <span className="block text-xs text-slate-500 font-bold uppercase mb-1">Data Points</span>
+                      <span className="block text-lg font-mono font-bold text-slate-800">{intradayAiResults.predictionsMap.length}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Scatter Plot for Predicted vs Actual Volume */}
+                <div className="h-[500px] w-full mt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={intradayAiResults.predictionsMap} margin={{ top: 20, right: 30, bottom: 20, left: 25 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis
+                        dataKey="actualVol"
+                        type="number"
+                        name="Actual EOD Volume"
+                        tickFormatter={(val) => (val >= 1000000 ? `${(val / 1000000).toFixed(1)}M` : `${(val / 1000).toFixed(0)}k`)}
+                      >
+                        <Label value="Actual End-of-Day Total Shares" offset={-10} position="insideBottom" style={{ fill: '#64748b', fontWeight: 'bold' }} />
+                      </XAxis>
+                      <YAxis
+                        dataKey="predictedVol"
+                        type="number"
+                        name="AI Predicted EOD Volume"
+                        tickFormatter={(val) => (val >= 1000000 ? `${(val / 1000000).toFixed(1)}M` : `${(val / 1000).toFixed(0)}k`)}
+                      >
+                        <Label value="AI Predicted EOD Shares" angle={-90} position="insideLeft" offset={-15} style={{ fill: '#64748b', fontWeight: 'bold' }} />
+                      </YAxis>
+                      <RechartsTooltip
+                        cursor={{ strokeDasharray: '3 3' }}
+                        content={({ active, payload }) => {
+                          if (active && payload && payload.length) {
+                            // Find the scatter point payload instead of the interpolated line point
+                            const dotPayload = payload.find(p => p.payload && p.payload.ticker);
+                            if (!dotPayload) return null;
+
+                            const d = dotPayload.payload;
+                            return (
+                              <div className="bg-white p-3 border border-slate-200 shadow-md rounded-lg text-sm min-w-[180px]">
+                                <p className="font-bold text-slate-800 mb-2 border-b pb-1">
+                                  {d.ticker} | {d.dateStr}
+                                </p>
+                                <div className="flex justify-between mb-1">
+                                  <span className="text-slate-500">Actual Shares:</span>
+                                  <span className="font-semibold">{Math.floor(d.actualVol).toLocaleString()}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-purple-600 font-medium">AI Predicted:</span>
+                                  <span className="font-bold text-purple-700">{Math.floor(d.predictedVol).toLocaleString()}</span>
+                                </div>
+                              </div>
+                            );
+                          }
+                          return null;
+                        }}
+                      />
+                      <Scatter name="Predictions" fill="#9333ea" opacity={0.6} />
+
+                      {aiRegressionResult && aiRegressionResult.fit && (
+                        <Line
+                          data={aiRegressionResult.lineData}
+                          dataKey="regressionVol"
+                          type="basis"
+                          stroke="#f59e0b"
+                          strokeWidth={3}
+                          dot={false}
+                          activeDot={false}
+                          name={`Best Fit (${aiRegressionResult.fit.type})`}
+                        />
+                      )}
+
+                      {/* A perfect prediction line y=x */}
+                      <Line
+
+                        data={[
+                          { actualVol: 0, predictedVol: 0 },
+                          {
+                            actualVol: intradayAiResults.predictionsMap.length > 0 ? Math.max(...intradayAiResults.predictionsMap.map(d => d.actualVol)) : 0,
+                            predictedVol: intradayAiResults.predictionsMap.length > 0 ? Math.max(...intradayAiResults.predictionsMap.map(d => d.actualVol)) : 0
+                          }
+                        ]}
+                        dataKey="predictedVol"
+                        stroke="#10b981"
+                        strokeWidth={2}
+                        dot={false}
+                        activeDot={false}
+                        name="Perfect Prediction Line"
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Max Excursion Tab Content */}
+        {activeTab === 'maxExcursion' && (
+          <div className="flex flex-col gap-6">
+            {/* Controls */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Max Excursion Predictor</h2>
+                <p className="text-sm text-slate-500">Predict a stock's intraday High & Low from the first minutes of trading data using 11 technical features.</p>
+              </div>
+
+              <div className="flex flex-col md:flex-row gap-4 items-end bg-emerald-50 p-4 rounded-lg border border-emerald-200">
+                <div className="flex flex-col w-full md:w-1/4">
+                  <label className="text-sm font-semibold text-slate-700 mb-2">Ticker Scope:</label>
+                  <select
+                    value={selectedMaxExcTicker}
+                    onChange={e => setSelectedMaxExcTicker(e.target.value)}
+                    className="bg-white border border-slate-300 text-slate-900 text-sm rounded-md focus:ring-emerald-500 focus:border-emerald-500 p-2 cursor-pointer outline-none w-full"
+                  >
+                    <option value="ALL">All Tickers ({intradayFiles.length} files)</option>
+                    {intradayFiles.map(f => <option key={f.ticker} value={f.ticker}>{f.ticker}</option>)}
+                  </select>
+                </div>
+
+                <div className="flex flex-col w-full md:w-1/4">
+                  <label className="text-sm font-semibold text-slate-700 mb-2 flex justify-between">
+                    <span>Minutes after open:</span>
+                    <span className="text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded font-bold">{maxExcMinutes} min</span>
+                  </label>
+                  <input
+                    type="range" min="5" max="30" step="5"
+                    value={maxExcMinutes}
+                    onChange={e => setMaxExcMinutes(Number(e.target.value))}
+                    className="w-full h-2 bg-slate-300 rounded-lg appearance-none cursor-pointer mt-2"
+                  />
+                </div>
+
+                <div className="flex flex-col w-full md:w-1/4">
+                  <label className="text-sm font-semibold text-slate-700 mb-2">Epochs:</label>
+                  <input
+                    type="number" min="10" max="300" step="10"
+                    value={maxExcTotalEpochs}
+                    onChange={e => setMaxExcTotalEpochs(Number(e.target.value))}
+                    className="bg-white border border-slate-300 text-sm rounded-md p-2 outline-none w-full"
+                  />
+                </div>
+
+                <div className="w-full md:w-auto ml-auto">
+                  <button
+                    onClick={handleTrainMaxExcursion}
+                    disabled={isMaxExcTraining}
+                    className={`py-2 px-6 rounded-md font-bold text-white transition-colors w-full md:w-auto whitespace-nowrap shadow-sm ${isMaxExcTraining ? 'bg-slate-400 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-700'}`}
+                  >
+                    {isMaxExcTraining ? `Training... ${maxExcTrainEpoch}/${maxExcTotalEpochs}` : 'Train Model'}
+                  </button>
+                  {isMaxExcTraining && (
+                    <div className="w-full bg-slate-200 rounded-full h-1.5 mt-2">
+                      <div className="bg-emerald-600 h-1.5 rounded-full transition-all duration-300" style={{ width: `${(maxExcTrainEpoch / maxExcTotalEpochs) * 100}%` }}></div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Manual Prediction Input */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
+              <h3 className="text-lg font-bold text-slate-800">Live Prediction</h3>
+              <p className="text-sm text-slate-500">Enter today's open price and first bar volume to get predicted High/Low.</p>
+              <div className="flex flex-col sm:flex-row gap-4 items-end">
+                <div className="flex flex-col flex-1">
+                  <label className="text-xs font-semibold text-slate-600 mb-1">Open Price ($)</label>
+                  <input
+                    type="number" step="0.01" placeholder="e.g. 55.00"
+                    value={manualMaxExcInput.open}
+                    onChange={e => setManualMaxExcInput(prev => ({ ...prev, open: e.target.value }))}
+                    className="border border-slate-300 rounded-md p-2 text-sm outline-none focus:ring-emerald-500 focus:border-emerald-500"
+                  />
+                </div>
+                <div className="flex flex-col flex-1">
+                  <label className="text-xs font-semibold text-slate-600 mb-1">First Bar Volume</label>
+                  <input
+                    type="number" placeholder="e.g. 350000"
+                    value={manualMaxExcInput.volume}
+                    onChange={e => setManualMaxExcInput(prev => ({ ...prev, volume: e.target.value }))}
+                    className="border border-slate-300 rounded-md p-2 text-sm outline-none focus:ring-emerald-500 focus:border-emerald-500"
+                  />
+                </div>
+                <button
+                  onClick={handleManualMaxExcPrediction}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-2 rounded-md text-sm transition-colors whitespace-nowrap"
+                >
+                  Predict High/Low
+                </button>
+              </div>
+
+              {maxExcPrediction && (
+                <div className="flex flex-col md:flex-row gap-4 mt-2">
+                  <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-lg flex-1 text-center">
+                    <span className="block text-xs font-bold text-emerald-700 uppercase mb-1">Predicted High</span>
+                    <span className="block text-2xl font-black text-emerald-800">${maxExcPrediction.predictedHigh.toFixed(2)}</span>
+                  </div>
+                  <div className="bg-red-50 border border-red-200 p-4 rounded-lg flex-1 text-center">
+                    <span className="block text-xs font-bold text-red-700 uppercase mb-1">Predicted Low</span>
+                    <span className="block text-2xl font-black text-red-800">${maxExcPrediction.predictedLow.toFixed(2)}</span>
+                  </div>
+                  <div className="bg-amber-50 border border-amber-200 p-4 rounded-lg flex-1 text-center">
+                    <span className="block text-xs font-bold text-amber-700 uppercase mb-1">Max Excursion (ADR)</span>
+                    <span className="block text-2xl font-black text-amber-800">{maxExcPrediction.excursionAdr.toFixed(2)}x</span>
+                    <span className="block text-xs text-amber-600">Projected RVol: {maxExcPrediction.projectedRVol.toFixed(2)}x</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Training Results */}
+            {maxExcResults && !isMaxExcTraining && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-6">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-100 pb-4">
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-800">Backtesting Results</h3>
+                    <p className="text-sm text-slate-500">Predicted vs Actual Max Excursion (in ADR multiples)</p>
+                  </div>
+                  <div className="mt-4 md:mt-0 flex flex-wrap items-center gap-4">
+                    <button
+                      onClick={async () => {
+                        setMaxExcSaveStatus('Saving...');
+                        try {
+                          const res = await saveModelToServer(maxExcResults.model, maxExcResults.preparedData, 'maxExcursion');
+                          if (res.success) {
+                            setMaxExcSaveStatus('Saved to max-excursion/');
+                            setTimeout(() => setMaxExcSaveStatus(null), 3000);
+                          } else {
+                            setMaxExcSaveStatus('Save failed!');
+                          }
+                        } catch (err) {
+                          setMaxExcSaveStatus('Save failed!');
+                        }
+                      }}
+                      disabled={!!maxExcSaveStatus}
+                      className="py-2 px-4 rounded-md font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 transition-colors text-sm shadow-sm"
+                      title="Save to public/models/max-excursion/"
+                    >
+                      {maxExcSaveStatus || 'Save Model to App'}
+                    </button>
+                    <div className="bg-emerald-50 p-3 rounded-lg border border-emerald-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-emerald-700 font-bold uppercase mb-1">R²</span>
+                      <span className="block text-lg font-mono font-bold text-emerald-900">{maxExcResults.rSquared.toFixed(3)}</span>
+                    </div>
+                    <div className="bg-amber-50 p-3 rounded-lg border border-amber-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-amber-700 font-bold uppercase mb-1">MSE</span>
+                      <span className="block text-lg font-mono font-bold text-amber-900">{maxExcResults.mse.toFixed(4)}</span>
+                    </div>
+                    <div className="bg-blue-50 p-3 rounded-lg border border-blue-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-blue-700 font-bold uppercase mb-1">Std Dev</span>
+                      <span className="block text-lg font-mono font-bold text-blue-900">±{maxExcResults.stdDev.toFixed(3)}</span>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 text-center min-w-[120px]">
+                      <span className="block text-xs text-slate-500 font-bold uppercase mb-1">Data Points</span>
+                      <span className="block text-lg font-mono font-bold text-slate-800">{maxExcResults.predictionsMap.length}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Scatter Plot */}
+                <div className="h-[450px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={maxExcResults.predictionsMap} margin={{ top: 20, right: 30, bottom: 20, left: 40 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis dataKey="actualMaxExc" type="number" name="Actual Max Excursion">
+                        <Label value="Actual Max Excursion (xADR)" offset={-10} position="insideBottom" style={{ fill: '#64748b', fontWeight: 'bold' }} />
+                      </XAxis>
+                      <YAxis dataKey="predictedMaxExc" type="number" name="Predicted">
+                        <Label value="Predicted Max Excursion (xADR)" angle={-90} position="insideLeft" offset={-5} style={{ fill: '#64748b', fontWeight: 'bold', fontSize: 12 }} />
+                      </YAxis>
+                      <RechartsTooltip
+                        cursor={{ strokeDasharray: '3 3' }}
+                        content={({ active, payload }) => {
+                          if (active && payload && payload.length) {
+                            const dotPayload = payload.find(p => p.payload && p.payload.ticker);
+                            if (!dotPayload) return null;
+                            const d = dotPayload.payload;
+                            return (
+                              <div className="bg-white p-3 border border-slate-200 shadow-md rounded-lg text-sm min-w-[200px]">
+                                <p className="font-bold text-slate-800 mb-2 border-b pb-1">{d.ticker} | {d.date}</p>
+                                <div className="flex justify-between mb-1"><span className="text-slate-500">Actual:</span><span className="font-semibold">{d.actualMaxExc.toFixed(2)}x ADR</span></div>
+                                <div className="flex justify-between mb-1"><span className="text-emerald-600">Predicted:</span><span className="font-bold text-emerald-700">{d.predictedMaxExc.toFixed(2)}x ADR</span></div>
+                                <div className="flex justify-between mb-1"><span className="text-slate-500">Open:</span><span>${d.dayOpen.toFixed(2)}</span></div>
+                                <div className="flex justify-between mb-1"><span className="text-green-600">Pred High:</span><span className="font-semibold">${d.predictedHigh.toFixed(2)}</span></div>
+                                <div className="flex justify-between"><span className="text-red-600">Pred Low:</span><span className="font-semibold">${d.predictedLow.toFixed(2)}</span></div>
+                              </div>
+                            );
+                          }
+                          return null;
+                        }}
+                      />
+                      <Scatter name="Predictions" fill="#10b981" opacity={0.6} />
+                      <Line
+                        data={[
+                          { actualMaxExc: 0, predictedMaxExc: 0 },
+                          {
+                            actualMaxExc: maxExcResults.predictionsMap.length > 0 ? Math.max(...maxExcResults.predictionsMap.map(d => d.actualMaxExc)) : 3,
+                            predictedMaxExc: maxExcResults.predictionsMap.length > 0 ? Math.max(...maxExcResults.predictionsMap.map(d => d.actualMaxExc)) : 3
+                          }
+                        ]}
+                        dataKey="predictedMaxExc"
+                        stroke="#10b981"
+                        strokeWidth={2}
+                        strokeDasharray="5 5"
+                        dot={false}
+                        activeDot={false}
+                        name="Perfect Prediction"
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Per-Ticker Breakdown */}
+                {maxExcResults.perTickerStats && maxExcResults.perTickerStats.length > 1 && (
+                  <div>
+                    <h4 className="text-md font-bold text-slate-700 mb-3">Per-Ticker Accuracy (MAE, sorted best → worst)</h4>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm text-left text-slate-600">
+                        <thead className="text-xs text-slate-500 uppercase bg-slate-50">
+                          <tr>
+                            <th className="px-4 py-2">Ticker</th>
+                            <th className="px-4 py-2">Data Points</th>
+                            <th className="px-4 py-2">MAE (xADR)</th>
+                            <th className="px-4 py-2">Accuracy</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {maxExcResults.perTickerStats.map(t => (
+                            <tr key={t.ticker} className="border-b border-slate-100 hover:bg-slate-50">
+                              <td className="px-4 py-2 font-semibold">{t.ticker}</td>
+                              <td className="px-4 py-2">{t.count}</td>
+                              <td className="px-4 py-2">{t.mae.toFixed(3)}</td>
+                              <td className="px-4 py-2">
+                                <div className="w-full bg-slate-200 rounded-full h-2">
+                                  <div className={`h-2 rounded-full ${t.mae < 0.3 ? 'bg-emerald-500' : t.mae < 0.5 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${Math.max(5, Math.min(100, (1 - t.mae) * 100))}%` }}></div>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 )}
               </div>
-            </div>
-          )}
-        </div>
+            )}
 
-        {/* Main Visualization */}
-        {marginalPlotState && (
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-            <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-end">
-              <div>
-                <h2 className="text-lg font-bold text-slate-800">Scatter Plot with Probability Distributions</h2>
-                <p className="text-xs text-slate-500">Y-Axis: Absolute Max Excursion Multiple. X-Axis: Relative Volume.</p>
-              </div>
-              {historicalRegression && (
-                <div className="mt-2 sm:mt-0 bg-blue-50 border border-blue-200 text-blue-800 text-xs px-3 py-1 rounded-full font-semibold">
-                  <span className="mr-2">Historical Fit ({historicalRegression.type}):</span>
-                  <span className="font-mono">{historicalRegression.equation}</span>
-                </div>
-              )}
-              {aiRegression && (
-                <div className="mt-2 sm:mt-0 bg-purple-50 border border-purple-200 text-purple-800 text-xs px-3 py-1 rounded-full font-semibold ml-2">
-                  <span className="mr-2">AI Fit ({aiRegression.type}):</span>
-                  <span className="font-mono">{aiRegression.equation}</span>
-                </div>
-              )}
-            </div>
-
-            <div className="h-[600px] w-full">
-              <Plot
-                data={marginalPlotState.traces}
-                layout={marginalPlotState.layout}
-                useResizeHandler={true}
-                style={{ width: '100%', height: '100%' }}
-                config={{ displayModeBar: false }}
-              />
-            </div>
-          </div>
-        )}
-
-
-        {/* Advanced Statistical Analysis: High Excursion Probabilities */}
-        {advancedStats.length > 0 && (
-          <div className="bg-white border border-slate-200 rounded-xl shadow-sm mt-6 overflow-hidden">
-            <div className="bg-slate-50 border-b border-slate-200 p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-              <div>
-                <h3 className="text-md font-bold text-slate-800">Advanced High-Excursion Probabilities</h3>
-                <p className="text-xs text-slate-500 mt-1">Historically analyzing the percentage of days that push a <strong>High Excursion (&ge; 1.5 ADR)</strong> once an RVol threshold is breached.</p>
-              </div>
-              <div className="bg-white border border-green-200 rounded-lg shadow-sm p-3 flex items-center space-x-3 whitespace-nowrap">
-                <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center flex-shrink-0">
-                  <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
-                </div>
-                <div>
-                  <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Total Data in Green Zone</div>
-                  <div className="text-xl font-bold text-green-700">
-                    {advancedStats.find(s => s.threshold === '1.5')?.overallFrequency || '0.00'}%
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {advancedStats.map((stat, idx) => (
-                <div key={idx} className="bg-slate-50 rounded-lg p-4 border border-slate-100 flex flex-col justify-between">
+            {/* Sensitivity Analysis */}
+            {maxExcResults && !isMaxExcTraining && (
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col gap-4">
+                <div className="flex justify-between items-center">
                   <div>
-                    <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">RVol threshold</div>
-                    <div className="text-lg font-bold text-slate-800 bg-white border border-slate-200 inline-block px-2 py-1 rounded shadow-sm">
-                      &ge; {stat.threshold}x
-                    </div>
+                    <h3 className="text-lg font-bold text-slate-800">Sensitivity Analysis</h3>
+                    <p className="text-sm text-slate-500">Permutation importance: measures R² drop when each feature is shuffled.</p>
                   </div>
-
-                  <div className="mt-4">
-                    <div className="flex justify-between items-end mb-1">
-                      <span className="text-sm font-medium text-slate-700">Green Zone Rate:</span>
-                      <span className="text-xl font-bold text-green-600">{stat.probability}%</span>
-                    </div>
-                    <div className="w-full bg-slate-200 rounded-full h-1.5 mb-3">
-                      <div className="bg-green-500 h-1.5 rounded-full" style={{ width: `${stat.probability}%` }}></div>
-                    </div>
-
-                    <div className="flex justify-between text-xs text-slate-500 mb-1">
-                      <span>Total Signal Days:</span>
-                      <span className="font-semibold text-slate-700">{stat.totalMatchingDays}</span>
-                    </div>
-                    <div className="flex justify-between text-xs text-slate-500 mb-1">
-                      <span>High Excursion Hits:</span>
-                      <span className="font-semibold text-green-700">{stat.highExcursionDays}</span>
-                    </div>
-                    <div className="flex justify-between text-xs text-slate-500 mb-1">
-                      <span>Avg. Excursion for Group:</span>
-                      <span className="font-semibold text-blue-600">{stat.avgExcursion}x</span>
-                    </div>
-                    <div className="flex justify-between text-xs text-slate-500 pt-2 mt-2 border-t border-slate-200">
-                      <span>Overall Frequency:</span>
-                      <span className="font-semibold">{stat.overallFrequency}%</span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {/* Custom RVol Input Block */}
-            <div className="bg-blue-50/50 border-t border-slate-200 p-4 sm:p-6">
-              <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center justify-between">
-                <div className="flex-1">
-                  <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-                    <svg className="w-5 h-5 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
-                    Custom RVol Green Zone Calculator
-                  </h4>
-                  <p className="text-xs text-slate-600 mt-1">
-                    Enter a specific minimum Relative Volume (RVol) across your datasets to calculate its historical probability of reaching a <span className="font-semibold text-green-700">1.5x+ ADR</span> Excursion.
-                  </p>
+                  <button
+                    onClick={handleRunSensitivity}
+                    disabled={isRunningSensitivity}
+                    className={`py-2 px-6 rounded-md font-bold text-white transition-colors text-sm shadow-sm ${isRunningSensitivity ? 'bg-slate-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+                  >
+                    {isRunningSensitivity ? 'Analyzing...' : 'Run Analysis'}
+                  </button>
                 </div>
 
-                <div className="flex items-stretch bg-white border border-blue-200 shadow-sm rounded-lg overflow-hidden w-full lg:w-auto">
-                  <div className="px-4 py-3 bg-slate-50 border-r border-blue-100 flex items-center justify-center">
-                    <span className="text-xs font-bold text-slate-500 tracking-wider">RVOL &ge;</span>
-                  </div>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    placeholder="e.g. 1.5"
-                    className="w-24 px-3 py-2 outline-none text-slate-800 font-bold focus:bg-blue-50 transition-colors"
-                    value={customRvolThreshold}
-                    onChange={(e) => setCustomRvolThreshold(e.target.value)}
-                  />
-                  <div className="flex-1 px-4 py-3 bg-blue-600 text-white flex items-center justify-between gap-4 min-w-[140px]">
-                    <div className="flex flex-col">
-                      <span className="text-[10px] uppercase font-semibold text-blue-200 tracking-wider leading-none mb-1">Green Zone Rate</span>
-                      <span className="text-2xl font-bold leading-none">{customStat ? customStat.probability : '0.00'}%</span>
+                {maxExcSensitivity && maxExcSensitivity.length > 0 && (
+                  <div className="space-y-2 mt-2">
+                    {maxExcSensitivity.map((feat, idx) => {
+                      // Find the original feature index in the full 11-feature list
+                      const allNames = ['Projected RVol', '% Change (Prev Day)', 'First Bar Vol / Avg Vol', 'First 5-min Range / ADR', '% Above Open after 5 min', 'Up/Down Vol Ratio (early)', '20-day ADR', 'ATR(14)', 'ATR Dist from 10 EMA', 'ATR Dist from 20 EMA', 'ATR Dist from 50 EMA'];
+                      const origIdx = allNames.indexOf(feat.featureName);
+                      return (
+                        <div key={idx} className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            checked={origIdx >= 0 ? enabledFeatures[origIdx] : true}
+                            onChange={() => {
+                              if (origIdx >= 0) {
+                                setEnabledFeatures(prev => {
+                                  const next = [...prev];
+                                  next[origIdx] = !next[origIdx];
+                                  return next;
+                                });
+                              }
+                            }}
+                            className="w-4 h-4 accent-emerald-600 cursor-pointer flex-shrink-0"
+                          />
+                          <span className={`text-sm font-medium w-48 text-right truncate ${origIdx >= 0 && !enabledFeatures[origIdx] ? 'text-slate-400 line-through' : 'text-slate-700'}`} title={feat.featureName}>{feat.featureName}</span>
+                          <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                            <div
+                              className={`h-6 rounded-full transition-all duration-500 ${feat.correlationSign === 'positive' ? 'bg-emerald-500' : 'bg-rose-500'} ${origIdx >= 0 && !enabledFeatures[origIdx] ? 'opacity-30' : ''}`}
+                              style={{ width: `${Math.min(100, Math.max(2, Math.abs(feat.importanceScore) * 500))}%` }}
+                            />
+                            <span className="absolute inset-0 flex items-center justify-center text-xs font-bold text-slate-800">
+                              {(feat.importanceScore * 100).toFixed(2)}% | {feat.correlationSign === 'positive' ? '+' : '−'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div className="flex items-center justify-between mt-4 pt-3 border-t border-slate-200">
+                      <p className="text-xs text-slate-400">Green = positive correlation with excursion, Red = negative. Uncheck low-impact features, then retrain.</p>
+                      <button
+                        onClick={handleTrainMaxExcursion}
+                        disabled={isMaxExcTraining || enabledFeatures.filter(Boolean).length < 2}
+                        className={`py-2 px-6 rounded-md font-bold text-white transition-colors text-sm shadow-sm ${isMaxExcTraining ? 'bg-slate-400 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-700'}`}
+                      >
+                        {isMaxExcTraining ? 'Retraining...' : `Retrain with ${enabledFeatures.filter(Boolean).length} Features`}
+                      </button>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
-
-              {customStat && !isNaN(parseFloat(customRvolThreshold)) && (
-                <div className="mt-4 pt-4 border-t border-blue-200/50 flex flex-wrap gap-x-6 gap-y-2 text-xs">
-                  <div className="flex flex-col">
-                    <span className="text-slate-500">Total Signal Days</span>
-                    <span className="font-semibold text-slate-800">{customStat.totalMatchingDays}</span>
-                  </div>
-                  <div className="flex flex-col">
-                    <span className="text-slate-500">High Excursion Hits</span>
-                    <span className="font-semibold text-green-700">{customStat.highExcursionDays}</span>
-                  </div>
-                  <div className="flex flex-col">
-                    <span className="text-slate-500">Avg. Group Excursion</span>
-                    <span className="font-semibold text-blue-700">{customStat.avgExcursion}x</span>
-                  </div>
-                  <div className="flex flex-col">
-                    <span className="text-slate-500">Overall Frequency</span>
-                    <span className="font-semibold text-slate-800">{customStat.overallFrequency}%</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}        {/* Statistical Summary Table Moved Below Chart */}
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mt-6">
-          <div className="p-6 border-b border-slate-200">
-            <h2 className="text-lg font-bold text-slate-800">Intraday Excursion by RVol Bucket</h2>
-            <p className="text-xs text-slate-500">Grouped analysis showing the mathematical expansion from the day's open to the high or low.</p>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left text-slate-600">
-              <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
-                <tr>
-                  <th scope="col" className="px-6 py-4 font-bold">RVol Bucket</th>
-                  <th scope="col" className="px-6 py-4 text-center">Sample Size</th>
-                  <th scope="col" className="px-6 py-4 text-center">RVol Prob.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Median Max Exc.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">&ge; Median Exc Prob.</th>
-                  <th scope="col" className="px-6 py-4 text-right whitespace-nowrap">Mean Max Exc.</th>
-                  <th scope="col" className="px-6 py-4 text-right font-bold text-slate-800 whitespace-nowrap">Absolute Max Exc.</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summaryStats.map((row, idx) => (
-                  <tr key={idx} className="bg-white border-b hover:bg-slate-50 transition-colors">
-                    <td className="px-6 py-4 font-semibold text-slate-900 whitespace-nowrap">
-                      {row.label}
-                    </td>
-                    <td className="px-6 py-4 text-center">
-                      <span className="bg-slate-100 text-slate-700 py-1 px-3 rounded-full text-xs font-medium">
-                        {row.sampleSize}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-center text-slate-500 font-medium">
-                      {row.sampleSize > 0 ? `${row.rvolProbability}%` : '-'}
-                    </td>
-                    <td className="px-6 py-4 text-right font-medium">{row.medianExcursion ? `${row.medianExcursion}x` : '-'}</td>
-                    <td className="px-6 py-4 text-right text-slate-500 font-medium whitespace-nowrap" title={`Probability of any day having an excursion of >= ${row.medianExcursion}x`}>
-                      {row.medianExcursionProb && row.sampleSize > 0 ? `${row.medianExcursionProb}%` : '-'}
-                    </td>
-                    <td className="px-6 py-4 text-right">{row.meanExcursion ? `${row.meanExcursion}x` : '-'}</td>
-                    <td className="px-6 py-4 text-right text-red-600 font-bold">{row.maxExcursion ? `${row.maxExcursion}x` : '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* Selected Ticker Stock Chart */}
-        {selectedTickerFilter !== 'ALL' && apexChartState && (
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mt-6">
-            <div className="mb-4">
-              <h2 className="text-lg font-bold text-slate-800">{selectedTickerFilter} Historical Chart (Last 6 Months)</h2>
-              <p className="text-xs text-slate-500">
-                Daily Candlesticks, Moving Averages (10, 20, 50 EMA), and Volume
-              </p>
-            </div>
-            <div className="w-full flex flex-col">
-              <ReactApexChart
-                options={apexChartState.priceOptions}
-                series={apexChartState.priceSeries}
-                type="line"
-                height={600}
-              />
-              <ReactApexChart
-                options={apexChartState.volumeOptions}
-                series={apexChartState.volumeSeries}
-                type="bar"
-                height={160}
-              />
-            </div>
+            )}
           </div>
         )}
-
 
       </div>
     </div>
