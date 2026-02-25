@@ -1,4 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
+import { getExpectedCumulativeVolumePercentage } from './mathUtils';
 
 // Configuration
 const SEQ_LENGTH = 5; // Use past 5 days to predict today
@@ -690,10 +691,10 @@ export const prepareMaxExcursionData = (intradayDataByDate, dailyFeatures, minut
         // --- Extract early-session features from first N bars ---
         const earlyBars = day.bars.slice(0, maxBars);
 
-        // 1. Projected RVol: sum of early bar volumes / avgVol * (totalBarsInDay / maxBars)
+        // 1. Projected RVol using U-shaped cumulative volume profile
         const earlyVolSum = earlyBars.reduce((s, b) => s + b.volume, 0);
-        // Approximate: typical trading day has 78 five-min bars (09:30 to 16:00)
-        const projectedDayVol = earlyVolSum * (78 / maxBars);
+        const expectedPct = getExpectedCumulativeVolumePercentage(minutesToUse);
+        const projectedDayVol = earlyVolSum / expectedPct;
         const projectedRVol = projectedDayVol / feat.avgVol50;
 
         // 2. % Change prev day

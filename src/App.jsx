@@ -3,7 +3,7 @@ import { ComposedChart, Scatter, Line, BarChart, Bar, Area, XAxis, YAxis, Cartes
 import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
 import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadModelFiles, evaluateLstmOnData, evaluateIntradayModel, runIntradayTfjsPipeline, saveModelToServer, runMaxExcursionPipeline, runSensitivityAnalysis, predictMaxExcursion } from './utils/tfjsEngine';
-import { findBestFitRegression } from './utils/mathUtils';
+import { findBestFitRegression, getExpectedCumulativeVolumePercentage } from './utils/mathUtils';
 
 // --- CONFIGURATION ---
 const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC', 'COHR', 'FIX', 'AU', 'VSCO', 'WPM'];
@@ -813,7 +813,9 @@ export default function App() {
           feat.adr20 > 0 && feat.avgVol50 > 0 && intra.dayOpen > 0) {
           const earlyBars = intra.bars.slice(0, maxBars);
           const earlyVolSum = earlyBars.reduce((s, b) => s + b.volume, 0);
-          const projectedRVol = (earlyVolSum * (78 / maxBars)) / feat.avgVol50;
+          const expectedPct = getExpectedCumulativeVolumePercentage(maxExcMinutes);
+          const projectedDayVol = earlyVolSum / expectedPct;
+          const projectedRVol = projectedDayVol / feat.avgVol50;
           const firstBarVolRatio = earlyBars[0].volume / feat.avgVol50;
 
           let earlyHigh = -Infinity, earlyLow = Infinity;
