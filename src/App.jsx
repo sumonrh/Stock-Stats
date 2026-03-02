@@ -4,6 +4,7 @@ import ReactApexChart from 'react-apexcharts';
 import Plot from 'react-plotly.js';
 import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadModelFiles, evaluateLstmOnData, evaluateIntradayModel, runIntradayTfjsPipeline, saveModelToServer, runMaxExcursionPipeline, runSensitivityAnalysis, predictMaxExcursion } from './utils/tfjsEngine';
 import { findBestFitRegression, getExpectedCumulativeVolumePercentage } from './utils/mathUtils';
+import MarketRegime from './MarketRegime';
 
 // --- CONFIGURATION ---
 const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC', 'COHR', 'FIX', 'AU', 'VSCO', 'WPM'];
@@ -1506,6 +1507,12 @@ export default function App() {
             >
               Max Excursion Predictor
             </button>
+            <button
+              onClick={() => setActiveTab('regime')}
+              className={`px-4 py-2 font-semibold text-sm ${activeTab === 'regime' ? 'border-b-2 border-orange-600 text-orange-600' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Market Regime
+            </button>
           </div>
         </div>
 
@@ -2637,6 +2644,10 @@ export default function App() {
               </div>
             )}
           </div>
+        )}
+
+        {activeTab === 'regime' && (
+          <MarketRegime />
         )}
 
       </div>

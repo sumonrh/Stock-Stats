@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
 
 // Setup model saving directory
 const MODELS_DIR = path.join(process.cwd(), 'public', 'models');
@@ -351,6 +351,76 @@ app.get('/api/intraday-features', async (req, res) => {
     } catch (error) {
         console.error(`Error computing features for ${req.query.ticker}:`, error);
         res.status(500).json({ error: 'Failed to compute intraday features' });
+    }
+});
+
+// --- MARKET REGIME ENDPOINT ---
+app.get('/api/market-regime', async (req, res) => {
+    try {
+        const yf = new yahooFinance();
+        const endDate = new Date();
+        const startDate = new Date();
+        startDate.setFullYear(startDate.getFullYear() - 3);
+
+        const queryOptions = {
+            period1: startDate,
+            period2: endDate,
+            interval: '1d',
+        };
+
+        const [spyResult, vixResult] = await Promise.all([
+            yf.chart('SPY', queryOptions),
+            yf.chart('^VIX', queryOptions),
+        ]);
+
+        const formatQuotes = (result) => {
+            if (!result || !result.quotes) return [];
+            return result.quotes
+                .map(d => ({
+                    date: typeof d.date === 'string' ? d.date.split('T')[0] : d.date.toISOString().split('T')[0],
+                    open: d.open,
+                    high: d.high,
+                    low: d.low,
+                    close: d.close,
+                    volume: d.volume
+                }))
+                .filter(d => d.close !== null);
+        };
+
+        const spyQuotes = formatQuotes(spyResult);
+        const vixQuotes = formatQuotes(vixResult);
+
+        // Build VIX lookup by date
+        const vixMap = {};
+        for (const q of vixQuotes) {
+            vixMap[q.date] = q;
+        }
+
+        // Align by date
+        const aligned = [];
+        let prevPrice = null;
+        for (const spy of spyQuotes) {
+            const vix = vixMap[spy.date];
+            if (!vix) continue;
+
+            const ret = prevPrice !== null ? (spy.close - prevPrice) / prevPrice : 0;
+
+            aligned.push({
+                day: spy.date,
+                price: spy.close,
+                vix: vix.close,
+                vixHigh: vix.high || vix.close,
+                vixLow: vix.low || vix.close,
+                ret
+            });
+
+            prevPrice = spy.close;
+        }
+
+        res.json(aligned);
+    } catch (error) {
+        console.error('Error fetching market regime data:', error);
+        res.status(500).json({ error: 'Failed to fetch market regime data' });
     }
 });
 
