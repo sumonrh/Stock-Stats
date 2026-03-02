@@ -96,25 +96,33 @@ export const prepareTfjsData = (tickerData) => {
 export const createLstmModel = (inputShape) => {
     const model = tf.sequential();
 
-    // LSTM Layer
+    // First LSTM Layer
     model.add(tf.layers.lstm({
-        units: 32,
-        returnSequences: false,
-        inputShape: inputShape // e.g. [SEQ_LENGTH, 3]
+        units: 64,
+        returnSequences: true,
+        inputShape: inputShape // [SEQ_LENGTH, 3]
     }));
-
-    // Dropout for regularization
     model.add(tf.layers.dropout({ rate: 0.2 }));
 
-    // Hidden Dense
+    // Second LSTM Layer
+    model.add(tf.layers.lstm({
+        units: 32,
+        returnSequences: false
+    }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+
+    // Dense hidden layers
+    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+    model.add(tf.layers.dropout({ rate: 0.1 }));
     model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
 
     // Linear output for regression
     model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
 
     model.compile({
-        optimizer: tf.train.adam(0.01),
-        loss: 'meanSquaredError'
+        optimizer: tf.train.adam(0.002), // Lower learning rate for stability
+        loss: 'meanSquaredError',
+        metrics: ['mae']
     });
 
     return model;
@@ -169,14 +177,17 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
 
     const model = createLstmModel([SEQ_LENGTH, 3]);
 
-    // Train with non-blocking generator loop
     let finalLoss = 0;
     let currentEpoch = 0;
+    let bestValLoss = Infinity;
+    let waitCount = 0;
+    let bestWeights = null;
 
     await model.fit(xs, ys, {
         epochs: epochs,
         batchSize: 32,
         shuffle: true,
+        validationSplit: 0.2,
         callbacks: {
             onEpochEnd: async (epoch, logs) => {
                 currentEpoch = epoch + 1;
@@ -184,10 +195,30 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
                 if (onProgress) {
                     onProgress(currentEpoch, epochs, logs.loss);
                 }
-                await tf.nextFrame(); // Let the UI render
+
+                // --- Manual Early Stopping ---
+                if (logs.val_loss !== undefined) {
+                    if (logs.val_loss < bestValLoss) {
+                        bestValLoss = logs.val_loss;
+                        waitCount = 0;
+                        bestWeights = model.getWeights().map(w => w.clone()); // Store copy of best weights
+                    } else {
+                        waitCount++;
+                        if (waitCount >= 10) {
+                            model.stopTraining = true;
+                            console.log(`Early stopping triggered at epoch ${epoch + 1}`);
+                        }
+                    }
+                }
+                await tf.nextFrame();
             }
         }
     });
+
+    if (bestWeights) {
+        model.setWeights(bestWeights);
+        bestWeights.forEach(w => w.dispose()); // Clean up clones
+    }
 
     // Predict
     const predsTensor = model.predict(xs);
@@ -526,17 +557,25 @@ export const prepareIntradayData = (intradayDataByDate, processedYfData, minutes
 export const createIntradayLstmModel = (sequenceLength) => {
     const model = tf.sequential();
     model.add(tf.layers.lstm({
-        units: 16,
-        returnSequences: false,
+        units: 32,
+        returnSequences: true,
         inputShape: [sequenceLength, 1]
     }));
     model.add(tf.layers.dropout({ rate: 0.2 }));
-    model.add(tf.layers.dense({ units: 8, activation: 'relu' }));
+
+    model.add(tf.layers.lstm({
+        units: 16,
+        returnSequences: false
+    }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+
+    model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
     model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
 
     model.compile({
-        optimizer: tf.train.adam(0.01),
-        loss: 'meanSquaredError'
+        optimizer: tf.train.adam(0.005),
+        loss: 'meanSquaredError',
+        metrics: ['mae']
     });
 
     return model;
@@ -554,11 +593,15 @@ export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfDat
 
     let finalLoss = 0;
     let currentEpoch = 0;
+    let bestValLoss = Infinity;
+    let waitCount = 0;
+    let bestWeights = null;
 
     await model.fit(xs, ys, {
         epochs: epochs,
         batchSize: 16,
         shuffle: true,
+        validationSplit: 0.2,
         callbacks: {
             onEpochEnd: async (epoch, logs) => {
                 currentEpoch = epoch + 1;
@@ -566,10 +609,30 @@ export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfDat
                 if (onProgress) {
                     onProgress(currentEpoch, epochs, logs.loss);
                 }
+
+                // --- Manual Early Stopping ---
+                if (logs.val_loss !== undefined) {
+                    if (logs.val_loss < bestValLoss) {
+                        bestValLoss = logs.val_loss;
+                        waitCount = 0;
+                        bestWeights = model.getWeights().map(w => w.clone());
+                    } else {
+                        waitCount++;
+                        if (waitCount >= 8) {
+                            model.stopTraining = true;
+                            console.log(`Intraday early stopping at epoch ${epoch + 1}`);
+                        }
+                    }
+                }
                 await tf.nextFrame();
             }
         }
     });
+
+    if (bestWeights) {
+        model.setWeights(bestWeights);
+        bestWeights.forEach(w => w.dispose());
+    }
 
     const predsTensor = model.predict(xs);
     const predsArray = await predsTensor.data();
@@ -825,16 +888,18 @@ export const prepareMaxExcursionData = (intradayDataByDate, dailyFeatures, minut
  */
 export const createMaxExcursionModel = (numFeatures) => {
     const model = tf.sequential();
-    model.add(tf.layers.dense({ units: 64, activation: 'relu', inputShape: [numFeatures] }));
+    model.add(tf.layers.dense({ units: 128, activation: 'relu', inputShape: [numFeatures] }));
     model.add(tf.layers.dropout({ rate: 0.3 }));
-    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+    model.add(tf.layers.dense({ units: 64, activation: 'relu' }));
     model.add(tf.layers.dropout({ rate: 0.2 }));
+    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
     model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
     model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
 
     model.compile({
-        optimizer: tf.train.adam(0.005),
-        loss: 'meanSquaredError'
+        optimizer: tf.train.adam(0.002),
+        loss: 'meanSquaredError',
+        metrics: ['mae']
     });
 
     return model;
@@ -854,20 +919,44 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
     const model = createMaxExcursionModel(numFeatures);
 
     let finalLoss = 0;
+    let currentEpoch = 0;
+    let bestValLoss = Infinity;
+    let waitCount = 0;
+    let bestWeights = null;
 
     await model.fit(xs, ys, {
         epochs,
         batchSize: 32,
         shuffle: true,
-        validationSplit: 0.15,
+        validationSplit: 0.2,
         callbacks: {
             onEpochEnd: async (epoch, logs) => {
                 finalLoss = logs.loss;
                 if (onProgress) onProgress(epoch + 1, epochs, logs.loss);
+
+                // --- Manual Early Stopping ---
+                if (logs.val_loss !== undefined) {
+                    if (logs.val_loss < bestValLoss) {
+                        bestValLoss = logs.val_loss;
+                        waitCount = 0;
+                        bestWeights = model.getWeights().map(w => w.clone());
+                    } else {
+                        waitCount++;
+                        if (waitCount >= 12) {
+                            model.stopTraining = true;
+                            console.log(`MaxExcursion early stopping at epoch ${epoch + 1}`);
+                        }
+                    }
+                }
                 await tf.nextFrame();
             }
         }
     });
+
+    if (bestWeights) {
+        model.setWeights(bestWeights);
+        bestWeights.forEach(w => w.dispose());
+    }
 
     // Predict
     const predsTensor = model.predict(xs);
