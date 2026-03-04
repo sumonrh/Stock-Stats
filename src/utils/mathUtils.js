@@ -90,7 +90,7 @@ const calcExponential = (data) => {
 /**
  * Gaussian Elimination to solve system of linear equations (Ax = B)
  */
-const gaussianElimination = (matrix, vector) => {
+export const gaussianElimination = (matrix, vector) => {
     let n = matrix.length;
     let A = matrix.map((row, i) => [...row, vector[i]]);
 
@@ -133,6 +133,53 @@ const gaussianElimination = (matrix, vector) => {
     }
 
     return x;
+};
+
+/**
+ * Multivariate Linear Regression using Ordinary Least Squares
+ * Solves (X^T * X) * theta = X^T * Y
+ * @param {Array<Array<number>>} X - 2D array of inputs [n_samples, n_features]
+ * @param {Array<number>} Y - 1D array of outputs [n_samples]
+ * @returns {Array<number>|null} [bias, w1, w2, ...] or null if singular
+ */
+export const calcMultivariateLinearRegression = (X, Y) => {
+    if (!X || !Y || X.length === 0 || X.length !== Y.length) return null;
+    const n = X.length;
+    const k = X[0].length;
+
+    // Create X matrix with bias: [1, x1, x2...]
+    const matrix = X.map(row => [1, ...row]);
+
+    // A = X^T * X
+    const A = [];
+    for (let i = 0; i < k + 1; i++) {
+        A[i] = [];
+        for (let j = 0; j < k + 1; j++) {
+            let sum = 0;
+            for (let row = 0; row < n; row++) {
+                sum += matrix[row][i] * matrix[row][j];
+            }
+            A[i][j] = sum;
+        }
+    }
+
+    // B = X^T * Y
+    const B_vec = [];
+    for (let i = 0; i < k + 1; i++) {
+        let sum = 0;
+        for (let row = 0; row < n; row++) {
+            sum += matrix[row][i] * Y[row];
+        }
+        B_vec.push(sum);
+    }
+
+    // Add small ridge penalty to diagonal to avoid singular matrix issues
+    for (let i = 0; i < k + 1; i++) {
+        A[i][i] += 1e-6;
+    }
+
+    // Solve A * theta = B_vec
+    return gaussianElimination(A, B_vec);
 };
 
 /**

@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { getExpectedCumulativeVolumePercentage } from './mathUtils';
+import { getExpectedCumulativeVolumePercentage, calcMultivariateLinearRegression } from './mathUtils';
 
 // Configuration
 const SEQ_LENGTH = 5; // Use past 5 days to predict today
@@ -9,8 +9,8 @@ const SEQ_LENGTH = 5; // Use past 5 days to predict today
  * Returns the normalized data, along with min and max for denormalization.
  */
 const normalize = (data) => {
-    const min = Math.min(...data);
-    const max = Math.max(...data);
+    const min = data.reduce((m, v) => (v < m ? v : m), Infinity);
+    const max = data.reduce((m, v) => (v > m ? v : m), -Infinity);
     if (max - min === 0) return { data: data.map(() => 0), min, max };
     const normalized = data.map((val) => (val - min) / (max - min));
     return { data: normalized, min, max };
@@ -38,39 +38,32 @@ export const prepareTfjsData = (tickerData) => {
     const rawRVols = sorted.map(d => d.rVol);
     const rawExcursions = sorted.map(d => d.maxExcursionAdr);
 
-    const { data: normRVols } = normalize(rawRVols);
-    const { data: normExcursions, min: excMin, max: excMax } = normalize(rawExcursions);
+    const splitIdx = Math.floor(rawRVols.length * 0.8);
+    const trainRVols = rawRVols.slice(0, splitIdx);
+    const trainExcursions = rawExcursions.slice(0, splitIdx);
+
+    const rvolMin = trainRVols.reduce((m, v) => v < m ? v : m, Infinity);
+    const rvolMax = trainRVols.reduce((m, v) => v > m ? v : m, -Infinity);
+
+    const excMin = trainExcursions.reduce((m, v) => v < m ? v : m, Infinity);
+    const excMax = trainExcursions.reduce((m, v) => v > m ? v : m, -Infinity);
+
+    const normRVols = rawRVols.map(v => rvolMax - rvolMin === 0 ? 0 : (v - rvolMin) / (rvolMax - rvolMin));
+    const normExcursions = rawExcursions.map(v => excMax - excMin === 0 ? 0 : (v - excMin) / (excMax - excMin));
 
     const inputs = [];
     const labels = [];
     const validDates = [];
-    const sourcePoints = []; // Keep reference to original point to map later
+    const sourcePoints = [];
 
-    // Build sequences
     for (let i = SEQ_LENGTH; i < sorted.length; i++) {
         const sequence = [];
         for (let j = i - SEQ_LENGTH; j < i; j++) {
-            // Historical features: past RVol and past Excursions
-            sequence.push([normRVols[j], normExcursions[j]]);
+            sequence.push([normRVols[j], normExcursions[j], 0]);
         }
-        // Also include today's rVol as that is our trigger mechanism 
-        // We append it to the sequence as another time step or feature?
-        // Let's just put it in the last step of the sequence as a 3rd feature, and 0 for past days.
-        // Actually, simpler: just feed the past 5 days, and let the LSTM figure it out.
-        // Wait, the prompt says predicting better than linear regression of TODAY's RVol. 
-        // If the LSTM doesn't see TODAY's RVol, it might be at a huge disadvantage.
-        // So let's add today's RVol to the final step of the sequence.
+        sequence[SEQ_LENGTH - 1][2] = normRVols[i];
 
-        // Feature shape: [past_RVol, past_Exc, todays_rVol_mask]
-        const seqWithToday = sequence.map((step, idx) => {
-            if (idx === SEQ_LENGTH - 1) {
-                return [step[0], step[1], normRVols[i]]; // At the last step, inject today's RVol
-            } else {
-                return [step[0], step[1], 0];
-            }
-        });
-
-        inputs.push(seqWithToday);
+        inputs.push(sequence);
         labels.push(normExcursions[i]);
         validDates.push(sorted[i].dateStr);
         sourcePoints.push(sorted[i]);
@@ -83,10 +76,11 @@ export const prepareTfjsData = (tickerData) => {
         sourcePoints,
         excMin,
         excMax,
-        rvolMin: normRVols.length > 0 ? Math.min(...rawRVols) : 0,
-        rvolMax: normRVols.length > 0 ? Math.max(...rawRVols) : 1,
-        // Save the very last historical sequence [pastRVol, pastExc] so we have a base to append 'today's' manual input to for inference without retraining
-        lastSequence: inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1]]) : []
+        rvolMin,
+        rvolMax,
+        SEQ_LENGTH,
+        // Save the very last sequence fully formed
+        lastSequence: inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1], step[2]]) : []
     };
 };
 
@@ -128,30 +122,7 @@ export const createLstmModel = (inputShape) => {
     return model;
 };
 
-/**
- * Trains the model and yields progress so the UI doesn't freeze.
- */
-export async function* trainModelGenerator(model, xs, ys, epochs = 50) {
-    let currentEpoch = 0;
-    let currentLoss = 0;
 
-    await model.fit(xs, ys, {
-        epochs: epochs,
-        batchSize: 32,
-        shuffle: true,
-        callbacks: {
-            onEpochEnd: async (epoch, logs) => {
-                currentEpoch = epoch + 1;
-                currentLoss = logs.loss;
-            }
-        },
-        // yieldEvery is required to not hang the browser
-        yieldEvery: 'epoch'
-    });
-
-    // Final yield when complete
-    yield { epoch: currentEpoch, loss: currentLoss, status: 'complete' };
-}
 
 /**
  * Computes the Mean Squared Error against standard scale data
@@ -172,8 +143,13 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
     const prepared = prepareTfjsData(tickerData);
     if (!prepared) return null;
 
-    const xs = tf.tensor3d(prepared.inputs);
-    const ys = tf.tensor2d(prepared.labels, [prepared.labels.length, 1]);
+    const splitIdx = Math.floor(prepared.inputs.length * 0.8);
+    const trainXsArray = prepared.inputs.slice(0, splitIdx);
+    const trainYsArray = prepared.labels.slice(0, splitIdx);
+    const testXsArray = prepared.inputs.slice(splitIdx);
+
+    const xs = tf.tensor3d(trainXsArray);
+    const ys = tf.tensor2d(trainYsArray, [trainYsArray.length, 1]);
 
     const model = createLstmModel([SEQ_LENGTH, 3]);
 
@@ -187,7 +163,7 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
         epochs: epochs,
         batchSize: 32,
         shuffle: true,
-        validationSplit: 0.2,
+        validationSplit: 0.2, // validation split on the 80%
         callbacks: {
             onEpochEnd: async (epoch, logs) => {
                 currentEpoch = epoch + 1;
@@ -201,7 +177,8 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
                     if (logs.val_loss < bestValLoss) {
                         bestValLoss = logs.val_loss;
                         waitCount = 0;
-                        bestWeights = model.getWeights().map(w => w.clone()); // Store copy of best weights
+                        if (bestWeights) bestWeights.forEach(w => w.dispose()); // Clean prior best
+                        bestWeights = model.getWeights().map(w => w.clone());
                     } else {
                         waitCount++;
                         if (waitCount >= 10) {
@@ -217,11 +194,12 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
 
     if (bestWeights) {
         model.setWeights(bestWeights);
-        bestWeights.forEach(w => w.dispose()); // Clean up clones
+        bestWeights.forEach(w => w.dispose());
     }
 
-    // Predict
-    const predsTensor = model.predict(xs);
+    // Predict ONLY on 20% validation split
+    const testXs = tf.tensor3d(testXsArray);
+    const predsTensor = model.predict(testXs);
     const predsArray = await predsTensor.data();
 
     // Denormalize predictions
@@ -230,19 +208,19 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
     );
 
     // Denormalize actuals for MSE
-    const actuals = prepared.labels.map(v => denormalizeValue(v, prepared.excMin, prepared.excMax));
+    const testActuals = prepared.labels.slice(splitIdx).map(v =>
+        denormalizeValue(v, prepared.excMin, prepared.excMax)
+    );
 
-    const mse = calculateMSE(denormPreds, actuals);
+    const mse = calculateMSE(denormPreds, testActuals);
 
-    // Cleanup tensors to prevent memory leaks in the browser
     xs.dispose();
     ys.dispose();
+    testXs.dispose();
     predsTensor.dispose();
-    // We keep the model in memory if we wanted to predict live, 
-    // but for this dashboard we return the mapped predictions to graph statically.
 
-    // Zip the original dates/points with their LSTM prediction so App.jsx can graph them easily
-    const predictionsMap = prepared.sourcePoints.map((pt, idx) => ({
+    const testSourcePoints = prepared.sourcePoints.slice(splitIdx);
+    const predictionsMap = testSourcePoints.map((pt, idx) => ({
         ...pt,
         lstmPredictedExc: denormPreds[idx]
     }));
@@ -289,7 +267,7 @@ export const evaluateLstmOnData = async (model, preparedDataMeta, tickerData) =>
     }
 
     // Also update lastSequence
-    preparedDataMeta.lastSequence = inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1]]) : preparedDataMeta.lastSequence;
+    preparedDataMeta.lastSequence = inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1], step[2]]) : preparedDataMeta.lastSequence;
 
     const xs = tf.tensor3d(inputs);
     const predsTensor = model.predict(xs);
@@ -323,9 +301,18 @@ export const evaluateLstmOnData = async (model, preparedDataMeta, tickerData) =>
  */
 export const saveModelToStorage = async (model, preparedData) => {
     try {
+        const metaToSave = { ...preparedData };
+        delete metaToSave.inputs;
+        delete metaToSave.labels;
+        delete metaToSave.validDates;
+        delete metaToSave.sourcePoints;
+        delete metaToSave.rawRVols;
+        delete metaToSave.rawInputs;
+        delete metaToSave.rawLabels;
+
         // 1. Save locally to browser IndexedDB
         await model.save('indexeddb://stock-lstm-model');
-        localStorage.setItem('stock-lstm-meta', JSON.stringify(preparedData));
+        localStorage.setItem('stock-lstm-meta', JSON.stringify(metaToSave));
 
         // 2. Fetch the newly saved model from IndexedDB as a Blob so we can send it to our backend
         // (TensorFlow.js doesn't easily return binary buffers directly from model.save('localstorage'), 
@@ -350,7 +337,7 @@ export const saveModelToStorage = async (model, preparedData) => {
             formData.append('modelWeights', weightBlob, 'stock-lstm-model.weights.bin');
 
             // Appends metadata
-            formData.append('metadata', JSON.stringify(preparedData, null, 2));
+            formData.append('metadata', JSON.stringify(metaToSave, null, 2));
 
             // POST to backend securely
             const response = await fetch('/api/save-model', {
@@ -398,8 +385,17 @@ export const downloadModelFiles = async (model, preparedData) => {
     try {
         await model.save('downloads://stock-lstm-model');
 
+        const metaToSave = { ...preparedData };
+        delete metaToSave.inputs;
+        delete metaToSave.labels;
+        delete metaToSave.validDates;
+        delete metaToSave.sourcePoints;
+        delete metaToSave.rawRVols;
+        delete metaToSave.rawInputs;
+        delete metaToSave.rawLabels;
+
         // Also trigger download of metadata json
-        const metadataStr = JSON.stringify(preparedData, null, 2);
+        const metadataStr = JSON.stringify(metaToSave, null, 2);
         const blob = new Blob([metadataStr], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -452,10 +448,7 @@ export const saveModelToServer = async (model, preparedData, modelType = 'daily'
                 format: artifacts.format,
                 generatedBy: artifacts.generatedBy,
                 convertedBy: artifacts.convertedBy,
-                weightsManifest: artifacts.weightSpecs ? [{
-                    paths: ['weights.bin'],
-                    weights: artifacts.weightSpecs
-                }] : []
+                weightsManifest: artifacts.weightsManifest
             })], { type: 'application/json' });
 
             formData.append('modelJson', modelJsonBlob, 'model.json');
@@ -463,7 +456,16 @@ export const saveModelToServer = async (model, preparedData, modelType = 'daily'
             const weightsBlob = new Blob([artifacts.weightData], { type: 'application/octet-stream' });
             formData.append('modelWeights', weightsBlob, 'weights.bin');
 
-            formData.append('metadata', JSON.stringify(preparedData));
+            const metaToSave = { ...preparedData };
+            delete metaToSave.inputs;
+            delete metaToSave.labels;
+            delete metaToSave.validDates;
+            delete metaToSave.sourcePoints;
+            delete metaToSave.rawRVols;
+            delete metaToSave.rawInputs;
+            delete metaToSave.rawLabels;
+
+            formData.append('metadata', JSON.stringify(metaToSave));
 
             let endpoint = '/api/save-model';
             if (modelType === 'intraday') endpoint = '/api/save-intraday-model';
@@ -540,8 +542,6 @@ export const prepareIntradayData = (intradayDataByDate, processedYfData, minutes
 
     if (inputs.length === 0) return null;
 
-    if (inputs.length === 0) return null;
-
     // Remove global min-max normalization, since volume/avgVol is natively self-normalized
     // and scaling globally crushes volatility across multi-stock arrays!
 
@@ -615,6 +615,7 @@ export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfDat
                     if (logs.val_loss < bestValLoss) {
                         bestValLoss = logs.val_loss;
                         waitCount = 0;
+                        if (bestWeights) bestWeights.forEach(w => w.dispose());
                         bestWeights = model.getWeights().map(w => w.clone());
                     } else {
                         waitCount++;
@@ -712,16 +713,20 @@ export const evaluateIntradayModel = async (model, preparedDataMeta, manualVolum
 
 const MAX_EXC_FEATURE_NAMES = [
     'Projected RVol',
-    '% Change (Prev Day)',
+    'Gap %',
     'First Bar Vol / Avg Vol',
     'First 5-min Range / ADR',
     '% Above Open after 5 min',
-    'Up/Down Vol Ratio (early)',
+    '20-Day Up/Down Ratio',
     '20-day ADR',
     'ATR(14)',
     'ATR Dist from 10 EMA',
     'ATR Dist from 20 EMA',
-    'ATR Dist from 50 EMA'
+    'ATR Dist from 50 EMA',
+    'VIX Open',
+    'VIX % Change',
+    'VIX 200 SMA',
+    'VIX Dist from 200 SMA'
 ];
 
 /**
@@ -778,13 +783,8 @@ export const prepareMaxExcursionData = (intradayDataByDate, dailyFeatures, minut
         const lastEarlyClose = earlyBars[earlyBars.length - 1].close;
         const pctAboveOpen = day.dayOpen > 0 ? ((lastEarlyClose - day.dayOpen) / day.dayOpen) * 100 : 0;
 
-        // 6. Up/Down volume ratio in early bars
-        let upVol = 0, downVol = 0;
-        for (const b of earlyBars) {
-            if (b.close >= b.open) upVol += b.volume;
-            else downVol += b.volume;
-        }
-        const upDownRatio = (downVol > 0) ? upVol / downVol : (upVol > 0 ? 10 : 1);
+        // 6. Up/Down volume ratio (Now using HISTORICAL 20-day from features)
+        const upDownRatio20 = feat.upDownRatio20 || 1;
 
         // 7. Normalized ADR (as fraction of price)
         const normAdr = day.dayOpen > 0 ? feat.adr20 / day.dayOpen : 0;
@@ -797,18 +797,27 @@ export const prepareMaxExcursionData = (intradayDataByDate, dailyFeatures, minut
         const atrDistEma20 = feat.atrDistEma20 || 0;
         const atrDistEma50 = feat.atrDistEma50 || 0;
 
+        const vixOpen = feat.vixOpen || 0;
+        const vixPctChange = feat.vixPctChange || 0;
+        const vixSma200 = feat.vixSma200 || 0;
+        const vixDistSma200 = feat.vixDistSma200 || 0;
+
         const featureVector = [
             projectedRVol,
             prevCloseChange,
             firstBarVolRatio,
             earlyRangeOverAdr,
             pctAboveOpen,
-            upDownRatio,
+            upDownRatio20,
             normAdr,
             normAtr,
             atrDistEma10,
             atrDistEma20,
-            atrDistEma50
+            atrDistEma50,
+            vixOpen,
+            vixPctChange,
+            vixSma200,
+            vixDistSma200
         ];
 
         // --- Label: actual max excursion from open as multiple of ADR ---
@@ -913,8 +922,22 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
     if (!prepared) return null;
 
     const numFeatures = prepared.inputs[0].length;
-    const xs = tf.tensor2d(prepared.inputs);
-    const ys = tf.tensor2d(prepared.labels, [prepared.labels.length, 1]);
+
+    // Chronological true out-of-sample split (80% Train, 20% Test)
+    const indices = prepared.sourcePoints.map((_, i) => i);
+    indices.sort((a, b) => new Date(prepared.sourcePoints[a].date).getTime() - new Date(prepared.sourcePoints[b].date).getTime());
+
+    const splitIdx = Math.floor(indices.length * 0.8);
+    const trainIndices = indices.slice(0, splitIdx);
+    const testIndices = indices.slice(splitIdx);
+
+    const trainXsArray = trainIndices.map(i => prepared.inputs[i]);
+    const trainYsArray = trainIndices.map(i => [prepared.labels[i]]);
+
+    const testXsArray = testIndices.map(i => prepared.inputs[i]);
+
+    const xs = tf.tensor2d(trainXsArray);
+    const ys = tf.tensor2d(trainYsArray);
 
     const model = createMaxExcursionModel(numFeatures);
 
@@ -928,7 +951,7 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
         epochs,
         batchSize: 32,
         shuffle: true,
-        validationSplit: 0.2,
+        validationSplit: 0.2, // 20% OF THE 80% used just for early stopping detection
         callbacks: {
             onEpochEnd: async (epoch, logs) => {
                 finalLoss = logs.loss;
@@ -939,6 +962,7 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
                     if (logs.val_loss < bestValLoss) {
                         bestValLoss = logs.val_loss;
                         waitCount = 0;
+                        if (bestWeights) bestWeights.forEach(w => w.dispose());
                         bestWeights = model.getWeights().map(w => w.clone());
                     } else {
                         waitCount++;
@@ -958,16 +982,19 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
         bestWeights.forEach(w => w.dispose());
     }
 
-    // Predict
-    const predsTensor = model.predict(xs);
+    // Predict ONLY on the hidden 20% chronologically out-of-sample data
+    const testXs = tf.tensor2d(testXsArray);
+    const predsTensor = model.predict(testXs);
     const predsArray = await predsTensor.data();
+
+    prepared.testIndices = testIndices;
 
     // Denormalize predictions and actuals
     const { labelMin, labelMax } = prepared.normParams;
     const denormPreds = Array.from(predsArray).map(v => v * (labelMax - labelMin) + labelMin);
-    const actuals = prepared.rawLabels;
+    const actuals = testIndices.map(i => prepared.rawLabels[i]);
 
-    // Calculate R² and MSE
+    // Calculate R² and MSE ONLY on unseen test set
     const meanActual = actuals.reduce((s, v) => s + v, 0) / actuals.length;
     let ssTot = 0, ssRes = 0, sumSqErr = 0;
     const errors = [];
@@ -982,17 +1009,20 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
     const mse = sumSqErr / actuals.length;
 
     const meanError = errors.reduce((s, e) => s + e, 0) / errors.length;
-    const stdDev = Math.sqrt(errors.reduce((s, e) => s + Math.pow(e - meanError, 2), 0) / errors.length);
+    const stdDev = Math.sqrt(errors.reduce((s, e) => s + Math.pow(e - meanError, 2), 0) / Math.max(1, errors.length));
 
-    // Build predictions map
-    const predictionsMap = prepared.sourcePoints.map((pt, idx) => ({
-        ...pt,
-        predictedMaxExc: denormPreds[idx],
-        predictedHigh: pt.dayOpen + denormPreds[idx] * pt.adr20,
-        predictedLow: pt.dayOpen - denormPreds[idx] * pt.adr20
-    }));
+    // Build predictions map for TEST SET ONLY
+    const predictionsMap = testIndices.map((origIdx, idx) => {
+        const pt = prepared.sourcePoints[origIdx];
+        return {
+            ...pt,
+            predictedMaxExc: denormPreds[idx],
+            predictedHigh: pt.dayOpen + denormPreds[idx] * pt.adr20,
+            predictedLow: pt.dayOpen - denormPreds[idx] * pt.adr20
+        };
+    });
 
-    // Per-ticker breakdown
+    // Per-ticker breakdown across TEST SET
     const tickerMap = {};
     for (const p of predictionsMap) {
         if (!tickerMap[p.ticker]) tickerMap[p.ticker] = { errors: [], count: 0 };
@@ -1005,8 +1035,28 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
         mae: data.errors.reduce((s, e) => s + e, 0) / data.errors.length
     })).sort((a, b) => a.mae - b.mae);
 
+    // Calculate standard linear baseline formula for the UI
+    let linearFormula = null;
+    try {
+        const theta = calcMultivariateLinearRegression(prepared.rawInputs, prepared.rawLabels);
+        if (theta && theta.length === prepared.featureNames.length + 1) {
+            let formulaParts = [theta[0].toFixed(3)];
+            for (let i = 0; i < prepared.featureNames.length; i++) {
+                const w = theta[i + 1];
+                if (Math.abs(w) > 0.001) {
+                    const sign = w >= 0 ? '+' : '-';
+                    formulaParts.push(`${sign} ${Math.abs(w).toFixed(3)} × (${prepared.featureNames[i]})`);
+                }
+            }
+            linearFormula = 'Max Exc (xADR) ≈ ' + formulaParts.join(' ');
+        }
+    } catch (err) {
+        console.error('Failed to compute linear formula:', err);
+    }
+
     xs.dispose();
     ys.dispose();
+    testXs.dispose();
     predsTensor.dispose();
 
     return {
@@ -1017,7 +1067,8 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
         predictionsMap,
         perTickerStats,
         model,
-        preparedData: prepared
+        preparedData: prepared,
+        linearFormula
     };
 };
 
@@ -1028,15 +1079,18 @@ export const runMaxExcursionPipeline = async (intradayData, dailyFeatures, minut
 export const runSensitivityAnalysis = async (model, preparedData) => {
     if (!preparedData || !preparedData.inputs || preparedData.inputs.length < 10) return [];
 
-    const { inputs, rawLabels, normParams, featureNames } = preparedData;
+    const { inputs, rawLabels, normParams, featureNames, testIndices } = preparedData;
     const { labelMin, labelMax } = normParams;
 
+    const evalIndices = testIndices || inputs.map((_, i) => i);
+    const evalInputs = evalIndices.map(i => inputs[i]);
+    const actuals = evalIndices.map(i => rawLabels[i]);
+
     // Get baseline R²
-    const baseXs = tf.tensor2d(inputs);
+    const baseXs = tf.tensor2d(evalInputs);
     const basePreds = await model.predict(baseXs).data();
     baseXs.dispose();
 
-    const actuals = rawLabels;
     const baseDenorm = Array.from(basePreds).map(v => v * (labelMax - labelMin) + labelMin);
     const meanActual = actuals.reduce((s, v) => s + v, 0) / actuals.length;
 
@@ -1051,8 +1105,8 @@ export const runSensitivityAnalysis = async (model, preparedData) => {
     const numFeatures = inputs[0].length;
 
     for (let f = 0; f < numFeatures; f++) {
-        // Create shuffled copy of inputs
-        const shuffled = inputs.map(row => [...row]);
+        // Create shuffled copy of eval inputs
+        const shuffled = evalInputs.map(row => [...row]);
         const colValues = shuffled.map(row => row[f]);
 
         // Fisher-Yates shuffle
@@ -1075,8 +1129,8 @@ export const runSensitivityAnalysis = async (model, preparedData) => {
 
         const importance = baseR2 - shuffR2; // Positive = feature helps
 
-        // Compute correlation sign from raw inputs
-        const rawCol = preparedData.rawInputs.map(row => row[f]);
+        // Compute correlation sign from raw out-of-sample inputs
+        const rawCol = evalIndices.map(i => preparedData.rawInputs[i][f]);
         const meanFeat = rawCol.reduce((s, v) => s + v, 0) / rawCol.length;
         let covSum = 0;
         for (let i = 0; i < rawCol.length; i++) {
@@ -1103,6 +1157,11 @@ export const predictMaxExcursion = async (model, normParams, featureVector, acti
 
     // Filter to only active features if mask was used during training
     const filtered = activeIndices ? activeIndices.map(i => featureVector[i]) : featureVector;
+
+    if (filtered.length !== featureMins.length) {
+        console.error(`predictMaxExcursion error: feature shape mismatch. Expected ${featureMins.length}, got ${filtered.length}.`);
+        return 0;
+    }
 
     // Normalize the feature vector using trained params
     const normalized = filtered.map((val, f) => {

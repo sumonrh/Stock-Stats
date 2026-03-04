@@ -144,7 +144,7 @@ export default function App() {
   const [manualMaxExcInput, setManualMaxExcInput] = useState({ open: '', volume: '' });
   const [maxExcPrediction, setMaxExcPrediction] = useState(null);
   const [enabledFeatures, setEnabledFeatures] = useState(
-    new Array(11).fill(true) // one boolean per feature, all on by default
+    new Array(15).fill(true) // one boolean per feature, all on by default
   );
   const [maxExcSaveStatus, setMaxExcSaveStatus] = useState(null);
   const [predTicker, setPredTicker] = useState('');
@@ -228,6 +228,7 @@ export default function App() {
     }
     setIntradayData(currentData);
     setIsIntradayLoading(false);
+    return currentData;
   };
 
   const volumeProfileDisplayData = useMemo(() => {
@@ -348,13 +349,15 @@ export default function App() {
   };
 
   // Process data when raw data or periods change
-  const processedData = useMemo(() => {
+  const getProcessedData = (marketData) => {
     let allProcessed = [];
-    for (const [ticker, rawData] of Object.entries(rawMarketData)) {
+    for (const [ticker, rawData] of Object.entries(marketData)) {
       allProcessed = allProcessed.concat(processTickerData(rawData, ticker, rvolPeriod, adrPeriod));
     }
     return allProcessed;
-  }, [rawMarketData, rvolPeriod, adrPeriod]);
+  };
+
+  const processedData = useMemo(() => getProcessedData(rawMarketData), [rawMarketData, rvolPeriod, adrPeriod]);
 
   // Filter and sort data for Recharts (Sorting by X axis is crucial for Line charts)
   const { chartData, historicalRegression } = useMemo(() => {
@@ -533,34 +536,34 @@ export default function App() {
 
   // Intraday Handlers
   const handleTrainIntraday = async () => {
-    await ensureIntradayData(selectedIntradayTicker);
+    const currentIntraday = await ensureIntradayData(selectedIntradayTicker);
 
     // Make sure the daily data is available for those tickers so we have avgVol
     const tickersToEnsure = selectedIntradayTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedIntradayTicker];
+    const updatedRawData = { ...rawMarketData };
     for (const ticker of tickersToEnsure) {
-      if (!rawMarketData[ticker]) {
-        const daily = await fetchRawTickerData(ticker);
-        setRawMarketData(prev => ({ ...prev, [ticker]: daily }));
+      if (!updatedRawData[ticker]) {
+        updatedRawData[ticker] = await fetchRawTickerData(ticker);
       }
     }
+    setRawMarketData(updatedRawData);
 
+    setIsIntradayLoading(true); // Ensure UI loading state if we just fetched
     setIsIntradayTraining(true);
     setIntradayAiResults(null);
     setManualIntradayResult(null);
 
     try {
-      // Because rawMarketData updates async, `processedData` might not immediately reflect the fetched data if we used setRawMarketData just now.
-      // However for safety, it'll use what's already built. If it wasn't loaded, user can click Train again. (Or we enforce ALL fetching upfront when they click 'ALL')
       let intradayListToUse = [];
       if (selectedIntradayTicker === 'ALL') {
-        for (const key of Object.keys(intradayData)) {
-          if (intradayData[key]) intradayListToUse = intradayListToUse.concat(intradayData[key]);
+        for (const key of Object.keys(currentIntraday)) {
+          if (currentIntraday[key]) intradayListToUse = intradayListToUse.concat(currentIntraday[key]);
         }
       } else {
-        intradayListToUse = intradayData[selectedIntradayTicker] || [];
+        intradayListToUse = currentIntraday[selectedIntradayTicker] || [];
       }
 
-      const dailyDataToUse = processedData;
+      const dailyDataToUse = getProcessedData(updatedRawData);
 
       const results = await runIntradayTfjsPipeline(
         intradayListToUse,
@@ -632,7 +635,7 @@ export default function App() {
   };
 
   const handleTrainMaxExcursion = async () => {
-    await ensureIntradayData(selectedMaxExcTicker);
+    const currentIntraday = await ensureIntradayData(selectedMaxExcTicker);
 
     const tickersToUse = selectedMaxExcTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedMaxExcTicker];
 
@@ -645,22 +648,23 @@ export default function App() {
     try {
       // Fetch daily features for each ticker
       const updatedFeatures = { ...maxExcDailyFeatures };
+      const updatedRawData = { ...rawMarketData };
       for (const ticker of tickersToUse) {
         if (!updatedFeatures[ticker]) {
           updatedFeatures[ticker] = await fetchDailyFeatures(ticker);
         }
-        if (!rawMarketData[ticker]) {
-          const daily = await fetchRawTickerData(ticker);
-          setRawMarketData(prev => ({ ...prev, [ticker]: daily }));
+        if (!updatedRawData[ticker]) {
+          updatedRawData[ticker] = await fetchRawTickerData(ticker);
         }
       }
       setMaxExcDailyFeatures(updatedFeatures);
+      setRawMarketData(updatedRawData);
 
       // Collect all intraday data
       let allIntraday = [];
       let allFeatures = [];
       for (const ticker of tickersToUse) {
-        const days = intradayData[ticker] || [];
+        const days = currentIntraday[ticker] || [];
         allIntraday = allIntraday.concat(days.map(d => ({ ...d, ticker })));
         allFeatures = allFeatures.concat(updatedFeatures[ticker] || []);
       }
@@ -683,6 +687,7 @@ export default function App() {
     }
     setIsMaxExcTraining(false);
   };
+
 
   const handleRunSensitivity = async () => {
     if (!maxExcResults || !maxExcResults.model || !maxExcResults.preparedData) return;
@@ -717,7 +722,9 @@ export default function App() {
     const latestFeat = features[features.length - 1];
 
     const avgVol = latestFeat.avgVol50 || 1000000;
-    const projectedRVol = (volume * 78) / avgVol;
+    const expectedPct = getExpectedCumulativeVolumePercentage(maxExcMinutes);
+    const projectedDayVol = volume / expectedPct;
+    const projectedRVol = projectedDayVol / avgVol;
     const firstBarVolRatio = volume / avgVol;
 
     const featureVector = [
@@ -726,12 +733,16 @@ export default function App() {
       firstBarVolRatio,
       0.3, // placeholder early range ratio
       0,   // placeholder pct above open
-      1,   // placeholder up/down ratio
+      latestFeat.upDownRatio20 || 1, // 20-Day Up/Down Ratio
       openPrice > 0 ? latestFeat.adr20 / openPrice : 0,
       openPrice > 0 ? latestFeat.atr14 / openPrice : 0,
       latestFeat.atrDistEma10 || 0,
       latestFeat.atrDistEma20 || 0,
-      latestFeat.atrDistEma50 || 0
+      latestFeat.atrDistEma50 || 0,
+      latestFeat.vixOpen || 0,
+      latestFeat.vixPctChange || 0,
+      latestFeat.vixSma200 || 0,
+      latestFeat.vixDistSma200 || 0
     ];
 
     try {
@@ -829,21 +840,18 @@ export default function App() {
           const lastEarlyClose = earlyBars[earlyBars.length - 1].close;
           const pctAboveOpen = intra.dayOpen > 0 ? ((lastEarlyClose - intra.dayOpen) / intra.dayOpen) * 100 : 0;
 
-          let upVol = 0, downVol = 0;
-          for (const b of earlyBars) {
-            if (b.close >= b.open) upVol += b.volume;
-            else downVol += b.volume;
-          }
-          const upDownRatio = downVol > 0 ? upVol / downVol : (upVol > 0 ? 10 : 1);
+          const upDownRatio20 = feat.upDownRatio20 || 1;
 
           const normAdr = intra.dayOpen > 0 ? feat.adr20 / intra.dayOpen : 0;
           const normAtr = intra.dayOpen > 0 ? feat.atr14 / intra.dayOpen : 0;
 
           const featureVector = [
             projectedRVol, feat.prevCloseChange || 0, firstBarVolRatio,
-            earlyRangeOverAdr, pctAboveOpen, upDownRatio,
+            earlyRangeOverAdr, pctAboveOpen, upDownRatio20,
             normAdr, normAtr,
-            feat.atrDistEma10 || 0, feat.atrDistEma20 || 0, feat.atrDistEma50 || 0
+            feat.atrDistEma10 || 0, feat.atrDistEma20 || 0, feat.atrDistEma50 || 0,
+            feat.vixOpen || 0, feat.vixPctChange || 0,
+            feat.vixSma200 || 0, feat.vixDistSma200 || 0
           ];
 
           const exc = await predictMaxExcursion(maxExcResults.model, normParams, featureVector, activeIndices);
@@ -2542,6 +2550,21 @@ export default function App() {
                   </ResponsiveContainer>
                 </div>
 
+                {/* Model Features Used */}
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 mt-2 mb-4">
+                  <h4 className="text-sm font-bold text-slate-700 mb-2">Features Extracted Live Before Prediction:</h4>
+                  <div className="flex flex-wrap gap-2">
+                    {maxExcResults.preparedData.featureNames.map((feat, i) => (
+                      <span key={i} className="px-2 py-1 bg-white border border-slate-300 shadow-sm rounded text-xs text-slate-700 font-medium">
+                        {feat}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-slate-500 mt-3 italic text-center">
+                    Note: The above chart displays STRICTLY out-of-sample backtesting results. The model was trained on the chronological first 80% of dates, and tested exclusively on the remaining unseen 20% to prevent overfitting or look-ahead bias.
+                  </p>
+                </div>
+
                 {/* Per-Ticker Breakdown */}
                 {maxExcResults.perTickerStats && maxExcResults.perTickerStats.length > 1 && (
                   <div>
@@ -2594,11 +2617,29 @@ export default function App() {
                   </button>
                 </div>
 
+                {/* Linear Regression Formula Display */}
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
+                  <h4 className="text-sm font-bold text-slate-700 mb-2">Linear Regression Proxy Formula:</h4>
+                  {maxExcResults.linearFormula ? (
+                    <>
+                      <div className="bg-white p-3 rounded border border-slate-200 overflow-x-auto shadow-inner text-sm font-mono text-slate-800 break-words whitespace-pre-wrap">
+                        {maxExcResults.linearFormula}
+                      </div>
+                      <p className="text-xs text-slate-500 mt-2 italic">
+                        Note: This static formula minimizes squares via generic linear regression to find a baseline 'envelope'.
+                      </p>
+                    </>
+                  ) : (
+                    <div className="text-sm text-slate-400 italic py-2">
+                      (Training regression baseline... Please wait or retrain to refresh indices.)
+                    </div>
+                  )}
+                </div>
+
                 {maxExcSensitivity && maxExcSensitivity.length > 0 && (
                   <div className="space-y-2 mt-2">
                     {maxExcSensitivity.map((feat, idx) => {
-                      // Find the original feature index in the full 11-feature list
-                      const allNames = ['Projected RVol', '% Change (Prev Day)', 'First Bar Vol / Avg Vol', 'First 5-min Range / ADR', '% Above Open after 5 min', 'Up/Down Vol Ratio (early)', '20-day ADR', 'ATR(14)', 'ATR Dist from 10 EMA', 'ATR Dist from 20 EMA', 'ATR Dist from 50 EMA'];
+                      const allNames = maxExcResults.preparedData.allFeatureNames || ['Projected RVol', 'Gap %', 'First Bar Vol / Avg Vol', 'First 5-min Range / ADR', '% Above Open after 5 min', '20-Day Up/Down Ratio', '20-day ADR', 'ATR(14)', 'ATR Dist from 10 EMA', 'ATR Dist from 20 EMA', 'ATR Dist from 50 EMA', 'VIX Open', 'VIX % Change', 'VIX 200 SMA', 'VIX Dist from 200 SMA'];
                       const origIdx = allNames.indexOf(feat.featureName);
                       return (
                         <div key={idx} className="flex items-center gap-3">
@@ -2629,8 +2670,9 @@ export default function App() {
                         </div>
                       );
                     })}
-                    <div className="flex items-center justify-between mt-4 pt-3 border-t border-slate-200">
-                      <p className="text-xs text-slate-400">Green = positive correlation with excursion, Red = negative. Uncheck low-impact features, then retrain.</p>
+
+                    <div className="flex flex-col md:flex-row items-center justify-between mt-4 pt-4 border-t border-slate-200 gap-4">
+                      <p className="text-xs text-slate-400 text-center md:text-left">Green = positive correlation, Red = negative. Uncheck low-impact features, then retrain.</p>
                       <button
                         onClick={handleTrainMaxExcursion}
                         disabled={isMaxExcTraining || enabledFeatures.filter(Boolean).length < 2}

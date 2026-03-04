@@ -260,22 +260,62 @@ app.get('/api/intraday-features', async (req, res) => {
         const startDate = new Date();
         startDate.setFullYear(startDate.getFullYear() - 2);
 
-        const result = await yf.chart(ticker, {
-            period1: startDate,
-            period2: endDate,
-            interval: '1d',
-        });
+        const [result, vixResult] = await Promise.all([
+            yf.chart(ticker, { period1: startDate, period2: endDate, interval: '1d' }),
+            yf.chart('^VIX', { period1: startDate, period2: endDate, interval: '1d' }).catch(() => null)
+        ]);
 
         if (!result || !result.quotes || result.quotes.length < 50) {
             return res.json([]);
         }
 
-        const quotes = result.quotes
-            .map(d => ({
-                date: typeof d.date === 'string' ? d.date.split('T')[0] : d.date.toISOString().split('T')[0],
-                open: d.open, high: d.high, low: d.low, close: d.close, volume: d.volume
-            }))
-            .filter(d => d.open !== null && d.close !== null);
+        const formatQuotes = (res) => {
+            if (!res || !res.quotes) return [];
+            return res.quotes
+                .map(d => ({
+                    date: typeof d.date === 'string' ? d.date.split('T')[0] : d.date.toISOString().split('T')[0],
+                    open: d.open, high: d.high, low: d.low, close: d.close, volume: d.volume
+                }))
+                .filter(d => d.open !== null && d.close !== null);
+        };
+
+        const quotes = formatQuotes(result);
+        const vixQuotes = formatQuotes(vixResult);
+
+        const vixMap = {};
+        for (let i = 0; i < vixQuotes.length; i++) {
+            let sma200 = 0;
+            if (i >= 200) {
+                let sum = 0;
+                for (let j = 1; j <= 200; j++) sum += vixQuotes[i - j].close;
+                sma200 = sum / 200;
+            }
+
+            let atr14 = 0;
+            if (i >= 14) {
+                let atrSum = 0;
+                for (let j = 1; j <= 14; j++) {
+                    const curr = vixQuotes[i - j];
+                    const prev = vixQuotes[i - j - 1];
+                    const prevClose = prev ? prev.close : curr.open;
+                    const tr = Math.max(
+                        curr.high - curr.low,
+                        Math.abs(curr.high - prevClose),
+                        Math.abs(curr.low - prevClose)
+                    );
+                    atrSum += tr;
+                }
+                atr14 = atrSum / 14;
+            }
+
+            vixMap[vixQuotes[i].date] = {
+                open: vixQuotes[i].open,
+                close: vixQuotes[i].close,
+                prevClose: i > 0 ? vixQuotes[i - 1].close : vixQuotes[i].open,
+                sma200,
+                atr14
+            };
+        }
 
         // Helper: EMA calculation
         const calcEma = (values, period) => {
@@ -306,8 +346,8 @@ app.get('/api/intraday-features', async (req, res) => {
             // ATR(14): average of true range over past 14 days
             let atrSum = 0;
             for (let j = 1; j <= 14; j++) {
-                const prev = quotes[i - j];
-                const curr = quotes[i - j + 1];
+                const prev = quotes[i - j - 1]; // Use i - j - 1 so we don't peek at today (i)
+                const curr = quotes[i - j];
                 const tr = Math.max(
                     curr.high - curr.low,
                     Math.abs(curr.high - prev.close),
@@ -322,13 +362,36 @@ app.get('/api/intraday-features', async (req, res) => {
             for (let j = 1; j <= 50; j++) volSum += quotes[i - j].volume;
             const avgVol50 = volSum / 50;
 
+            // 20-day Up/Down Volume Ratio
+            let upVol20 = 0;
+            let downVol20 = 0;
+            for (let j = 1; j <= 20; j++) {
+                const pastDay = quotes[i - j];
+                if (pastDay.close > pastDay.open) upVol20 += pastDay.volume;
+                else downVol20 += pastDay.volume;
+            }
+            const upDownRatio20 = downVol20 > 0 ? (upVol20 / downVol20) : (upVol20 > 0 ? 10 : 1);
+
             // % change from prev day
             const prevCloseChange = prevQ.close > 0 ? ((q.open - prevQ.close) / prevQ.close) * 100 : 0;
 
             // ATR distance from EMAs (in ATR units)
-            const atrDistEma10 = atr14 > 0 ? (q.open - ema10[i]) / atr14 : 0;
-            const atrDistEma20 = atr14 > 0 ? (q.open - ema20[i]) / atr14 : 0;
-            const atrDistEma50 = atr14 > 0 ? (q.open - ema50[i]) / atr14 : 0;
+            // Use EMA from previous day (i - 1) to prevent leaking today's close
+            const atrDistEma10 = atr14 > 0 ? (q.open - ema10[i - 1]) / atr14 : 0;
+            const atrDistEma20 = atr14 > 0 ? (q.open - ema20[i - 1]) / atr14 : 0;
+            const atrDistEma50 = atr14 > 0 ? (q.open - ema50[i - 1]) / atr14 : 0;
+
+            const vix = vixMap[q.date];
+            let vixOpen = 0;
+            let vixPctChange = 0;
+            let vixSma200 = 0;
+            let vixDistSma200 = 0;
+            if (vix) {
+                vixOpen = vix.open;
+                vixPctChange = vix.prevClose > 0 ? ((vix.open - vix.prevClose) / vix.prevClose) * 100 : 0;
+                vixSma200 = vix.sma200;
+                vixDistSma200 = vix.atr14 > 0 ? (vix.open - vix.sma200) / vix.atr14 : 0;
+            }
 
             features.push({
                 date: q.date,
@@ -338,12 +401,17 @@ app.get('/api/intraday-features', async (req, res) => {
                 adr20,
                 atr14,
                 avgVol50,
-                ema10: ema10[i],
-                ema20: ema20[i],
-                ema50: ema50[i],
+                upDownRatio20,
+                ema10: ema10[i - 1], // Store yesterday's EMA rather than today's
+                ema20: ema20[i - 1],
+                ema50: ema50[i - 1],
                 atrDistEma10,
                 atrDistEma20,
-                atrDistEma50
+                atrDistEma50,
+                vixOpen,
+                vixPctChange,
+                vixSma200,
+                vixDistSma200
             });
         }
 
