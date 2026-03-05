@@ -162,8 +162,11 @@ router.post('/run', async (req, res) => {
                     }
                     const adrDollarAverage = adrDollarSum / 20;
 
-                    // The percent change absolute size relative to the stock's average daily movement
-                    const priceDollarChange = Math.abs(currentPrice - prevClose);
+                    // The percent change relative to the stock's average daily movement
+                    const isRedDay = currentPrice < q.open;
+                    const referencePrice = isRedDay ? q.high : q.low;
+                    // For red days, currentPrice - high will be negative. For green/flat days, currentPrice - low will be positive.
+                    const priceDollarChange = currentPrice - referencePrice;
                     const priceChangeOverAdr = adrDollarAverage > 0 ? (priceDollarChange / adrDollarAverage) : 0;
 
                     // RVol (50 days)

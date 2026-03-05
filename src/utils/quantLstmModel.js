@@ -1,9 +1,27 @@
 import * as tf from '@tensorflow/tfjs';
 
+// Initialize WebGL/WASM backend for browser multi-core / GPU limits
+let backendInitialized = false;
+export const initTfBackend = async () => {
+    if (backendInitialized) return;
+    try {
+        await tf.setBackend('webgl');
+        await tf.ready();
+        console.log("TFJS WebGL backend enabled for fast GPU acceleration.");
+    } catch (e) {
+        try {
+            await tf.setBackend('wasm'); // use WebAssembly if WebGL fails
+            await tf.ready();
+            console.log("TFJS WASM backend enabled for multi-core CPU computation.");
+        } catch (err) {
+            console.log("Using default TFJS CPU backend.");
+        }
+    }
+    backendInitialized = true;
+};
+
 /**
  * Prepares the backtest dataset for LSTM training
- * Features: rsDelta, rVol, percentADR, ema10DistAtr, ema20DistAtr, quantScore (optional, or we use it later)
- * Target: ret1W or ret1M
  */
 export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', sequenceLength = 5) => {
     // 1. Sort chronological grouping by ticker
@@ -18,35 +36,39 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
     }
 
     const featureKeys = [
-        'rsDelta',              // slope %
-        'vcp',                  // 0 to 3
-        'rVol',                 // typically 0 to 10
-        'priceChangeOverAdr',   // EPS proxy, move size / ADR
-        'episodicPivotPower',   // EPS power, RVol * move size
-        'ema10DistAtr',         // typically -5 to 5
-        'ema20DistAtr'          // typically -5 to 5
+        'rsDelta',
+        'vcp',
+        'rVol',
+        'priceChangeOverAdr',
+        'episodicPivotPower',
+        'ema10DistAtr',
+        'ema20DistAtr'
     ];
 
-    // 2. Global Min/Max Normalization Stats
+    // 2. Compute Z-Score Normalization Stats (Mean and StdDev)
+    // Z-Score is vastly superior to MinMax here because episodic pivots/RVol can have massive outliers
+    // which compress normal signals into near-zero variance.
     const stats = {};
     featureKeys.forEach(key => {
-        const values = backtestData.map(d => d[key]);
-        stats[key] = {
-            min: Math.min(...values),
-            max: Math.max(...values)
-        };
+        const values = backtestData.map(d => d[key] != null ? d[key] : 0);
+        const sum = values.reduce((a, b) => a + b, 0);
+        const mean = sum / values.length;
+        const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
+        const std = Math.sqrt(variance) || 1; // avoid divide by zero
+        stats[key] = { mean, std };
     });
 
-    // Also get stats for target to denormalize later
-    const targetValues = backtestData.map(d => d[targetFeature]);
-    stats.target = {
-        min: Math.min(...targetValues),
-        max: Math.max(...targetValues)
-    };
+    const targetValues = backtestData.map(d => d[targetFeature] != null ? d[targetFeature] : 0);
+    const targetSum = targetValues.reduce((a, b) => a + b, 0);
+    const targetMean = targetSum / targetValues.length;
+    const targetVariance = targetValues.reduce((a, b) => a + Math.pow(b - targetMean, 2), 0) / targetValues.length;
+    const targetStd = Math.sqrt(targetVariance) || 1;
+    stats.target = { mean: targetMean, std: targetStd };
 
-    const normalize = (val, min, max) => {
-        if (max === min) return 0.5;
-        return (val - min) / (max - min);
+    const normalize = (val, mean, std) => {
+        // Robust scaling: clip extreme outliers (+/- 5 standard deviations) to prevent model explosion
+        const z = (val - mean) / std;
+        return Math.max(-5, Math.min(5, z));
     };
 
     const sequences = [];
@@ -55,46 +77,44 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
     // 3. Create Rolling Sequences per Ticker
     for (let ticker in dataByTicker) {
         const rows = dataByTicker[ticker];
-        if (rows.length <= sequenceLength) continue;
+        if (rows.length < sequenceLength) continue;
 
-        for (let i = sequenceLength; i < rows.length; i++) {
+        for (let i = sequenceLength - 1; i < rows.length; i++) {
             const seq = [];
-            for (let j = sequenceLength; j > 0; j--) {
+            // FIX: Include day `i` in the features to remove the 1-day look-ahead/lag bias!
+            // We want features up to day `i` to predict forward return from day `i`
+            for (let j = sequenceLength - 1; j >= 0; j--) {
                 const stepRow = rows[i - j];
-                const featureVector = featureKeys.map(key => normalize(stepRow[key], stats[key].min, stats[key].max));
+                const featureVector = featureKeys.map(key => normalize(stepRow[key], stats[key].mean, stats[key].std));
                 seq.push(featureVector);
             }
             sequences.push(seq);
 
             // Normalize Target
-            targets.push(normalize(rows[i][targetFeature], stats.target.min, stats.target.max));
+            targets.push(normalize(rows[i][targetFeature], stats.target.mean, stats.target.std));
         }
     }
 
     return { sequences, targets, stats, featureKeys };
 };
 
-/**
- * Builds and Compiles the LSTM Model
- */
 export const buildQuantLstmModel = (sequenceLength, numFeatures) => {
     const model = tf.sequential();
 
-    // LSTM Layer
+    // 1st LSTM Layer (Single layer is preferred in browser to prevent thread freezing)
     model.add(tf.layers.lstm({
-        units: 64, // Increased capacity
+        units: 64,
         inputShape: [sequenceLength, numFeatures],
         returnSequences: false
     }));
-
-    // Regularization
     model.add(tf.layers.dropout({ rate: 0.2 }));
 
-    // Dense Layers for prediction
+    // Dense Layers
     model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
     model.add(tf.layers.dropout({ rate: 0.1 }));
-    model.add(tf.layers.dense({ units: 1 })); // Linear activation for regression
+    model.add(tf.layers.dense({ units: 1 })); // Linear output
 
+    // Compile with Mean Squared Error
     model.compile({
         optimizer: tf.train.adam(0.001),
         loss: 'meanSquaredError'
@@ -109,6 +129,9 @@ export const buildQuantLstmModel = (sequenceLength, numFeatures) => {
 export const trainQuantModel = async (backtestData, targetFeature, sequenceLength, epochs, onEpochEndMsg) => {
     if (!backtestData || backtestData.length === 0) throw new Error("No data provided");
 
+    // Pre-init webGL acceleration
+    await initTfBackend();
+
     const { sequences, targets, stats, featureKeys } = prepareQuantDataForLstm(backtestData, targetFeature, sequenceLength);
 
     if (sequences.length === 0) throw new Error("Not enough sequential data to train");
@@ -121,13 +144,14 @@ export const trainQuantModel = async (backtestData, targetFeature, sequenceLengt
     // Early Stopping Configuration
     let bestLoss = Infinity;
     let patienceCounter = 0;
-    const patience = 10; // Stop if val_loss doesn't improve for 10 epochs
+    const patience = 12; // Adjusted for deeper net
     let finalEpoch = 0;
 
     await model.fit(xs, ys, {
         epochs: epochs,
-        batchSize: 32,
-        validationSplit: 0.2, // Use 20% for testing
+        batchSize: 64, // Larger batch size to utilize GPU/CPU parallelism better
+        validationSplit: 0.2,
+        yieldEvery: 'epoch', // Prevents browser from freezing by yielding to the main thread
         callbacks: {
             onEpochEnd: (epoch, logs) => {
                 finalEpoch = epoch + 1;
@@ -169,23 +193,19 @@ export const trainQuantModel = async (backtestData, targetFeature, sequenceLengt
 
 /**
  * Live Prediction using trained model
- * @param {tf.Sequential} model 
- * @param {Object} stats The normalization stats output from training
- * @param {Array} featureKeys Ordered list of feature names used during training
- * @param {Array<Object>} recentHistory The last N days of data objects (length must equal sequenceLength)
  */
 export const predictFutureReturn = (model, stats, featureKeys, recentHistory) => {
     const sequenceLength = recentHistory.length;
 
-    const normalize = (val, min, max) => {
-        if (max === min) return 0.5;
-        return (val - min) / (max - min);
+    const normalize = (val, mean, std) => {
+        const z = (val - mean) / std;
+        return Math.max(-5, Math.min(5, z));
     };
 
     const seq = [];
     for (let i = 0; i < sequenceLength; i++) {
         const stepRow = recentHistory[i];
-        const featureVector = featureKeys.map(key => normalize(stepRow[key] || 0, stats[key].min, stats[key].max));
+        const featureVector = featureKeys.map(key => normalize(stepRow[key] || 0, stats[key].mean, stats[key].std));
         seq.push(featureVector);
     }
 
@@ -196,56 +216,49 @@ export const predictFutureReturn = (model, stats, featureKeys, recentHistory) =>
     inputTensor.dispose();
     predictionTensor.dispose();
 
-    // Denormalize the output
-    const targetMin = stats.target.min;
-    const targetMax = stats.target.max;
-    const finalPredictedReturn = (normalizedPrediction * (targetMax - targetMin)) + targetMin;
+    // Denormalize the output (Reverse Z-score)
+    const finalPredictedReturn = (normalizedPrediction * stats.target.std) + stats.target.mean;
 
     return finalPredictedReturn;
 };
 
 /**
- * Runs sensitivity analysis on the trained model by systematically zeroing out features
- * to determine their relative impact on Mean Absolute Error (MAE)
+ * Runs sensitivity analysis on the trained model
  */
 export const runSensitivityAnalysis = async (model, xs, ys, featureKeys) => {
     const numSamples = xs.shape[0];
     const seqLength = xs.shape[1];
     const numFeatures = xs.shape[2];
 
-    // Baseline MAE
+    // Baseline Error
     const baselinePreds = model.predict(xs);
-    const baselineMae = tf.losses.absoluteDifference(ys, baselinePreds).dataSync()[0];
+    const baselineError = tf.losses.absoluteDifference(ys, baselinePreds).dataSync()[0];
     baselinePreds.dispose();
 
     const analysis = [];
 
     // Test each feature
     for (let f = 0; f < numFeatures; f++) {
-        // Create a copy of the tensor data
         const xsData = await xs.data();
         const maskedData = new Float32Array(xsData.length);
 
         // Copy data but mask (zero out) the specific feature
         for (let i = 0; i < xsData.length; i++) {
-            // Calculate which feature this index belongs to
-            // i is a flat index mapping to [sample, seqStep, feature]
             const featureIndex = i % numFeatures;
             if (featureIndex === f) {
-                maskedData[i] = 0.5; // Set to the normalized "neutral/zero" point (which is 0.5 based on our normalization) instead of strictly 0
+                // IMPORTANT FIX: Z-Score mean is 0. So to neutralize a feature exactly to its historical average, set it to 0.
+                maskedData[i] = 0;
             } else {
                 maskedData[i] = xsData[i];
             }
         }
 
         const maskedXs = tf.tensor3d(maskedData, [numSamples, seqLength, numFeatures]);
-
-        // Predict with masked feature
         const maskedPreds = model.predict(maskedXs);
-        const maskedMae = tf.losses.absoluteDifference(ys, maskedPreds).dataSync()[0];
+        const maskedError = tf.losses.absoluteDifference(ys, maskedPreds).dataSync()[0];
 
         // Calculate Error Increase (higher = feature is more important)
-        const maeIncrease = maskedMae - baselineMae;
+        const maeIncrease = maskedError - baselineError;
 
         analysis.push({
             feature: featureKeys[f],
