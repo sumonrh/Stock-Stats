@@ -4,6 +4,7 @@ import yahooFinance from 'yahoo-finance2';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
+import quantBacktestRouter from './routes/quantBacktest.js';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -50,6 +51,9 @@ const upload = multer({
 
 app.use(cors());
 app.use(express.json());
+
+// Add the new Quant Backtest historical logic
+app.use('/api/quant-backtest', quantBacktestRouter);
 
 app.get('/api/yahoo-finance2', async (req, res) => {
     try {
