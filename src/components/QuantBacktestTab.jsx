@@ -11,35 +11,29 @@ const BINS = [
 ];
 
 export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
-    const [backtestTickers, setBacktestTickers] = useState(['NVDA', 'TSLA', 'PLTR', 'AAPL', 'MSFT']);
-    const [newTickerInput, setNewTickerInput] = useState('');
     const [backtestData, setBacktestData] = useState([]);
     const [loading, setLoading] = useState(false);
+
+    // Data Loader State
+    const [loaderInput, setLoaderInput] = useState('');
+    const [loadedTickers, setLoadedTickers] = useState([]);
+    const [isLoaderLoading, setIsLoaderLoading] = useState(false);
 
     const [xAxisMetric, setXAxisMetric] = useState('quantScore');
     const [yAxisMetric, setYAxisMetric] = useState('ret1W');
     const [colorMetric, setColorMetric] = useState('vcp');
+    const [isCacheLoading, setIsCacheLoading] = useState(false);
 
-    const handleAddTicker = (e) => {
-        e.preventDefault();
-        const symbol = newTickerInput.trim().toUpperCase();
-        if (symbol && !backtestTickers.includes(symbol)) {
-            setBacktestTickers(prev => [...prev, symbol]);
-        }
-        setNewTickerInput('');
-    };
 
-    const handleRemoveTicker = (ticker) => {
-        setBacktestTickers(prev => prev.filter(t => t !== ticker));
-    };
 
     const runBacktest = async () => {
         setLoading(true);
+        const tickersToRun = loadedTickers.map(t => t.ticker);
         try {
             const res = await fetch('/api/quant-backtest/run', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tickers: backtestTickers })
+                body: JSON.stringify({ tickers: tickersToRun })
             });
             const data = await res.json();
             if (res.ok) {
@@ -64,38 +58,171 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
         }));
     }, [backtestData, xAxisMetric, yAxisMetric, colorMetric]);
 
+    const handleLoadTickers = async (e) => {
+        e.preventDefault();
+        const tickers = loaderInput.split(',').map(t => t.trim().toUpperCase()).filter(t => t);
+        if (tickers.length === 0) return;
+
+        setIsLoaderLoading(true);
+        try {
+            const res = await fetch('/api/data-loader/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tickers })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setLoadedTickers(prev => {
+                    const existingMap = new Map(prev.map(item => [item.ticker, item]));
+                    data.forEach(item => existingMap.set(item.ticker, item));
+                    return Array.from(existingMap.values());
+                });
+                setLoaderInput('');
+            } else {
+                alert("Error: " + data.error);
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Failed to load tickers");
+        }
+        setIsLoaderLoading(false);
+    };
+
+    const handleLoadCache = async () => {
+        setIsCacheLoading(true);
+        try {
+            const res = await fetch('/api/data-loader/cache');
+            const cachedTickers = await res.json();
+            if (cachedTickers.length > 0) {
+                // Pre-fill the input box with all cached names, then auto-fire load
+                const tickerString = cachedTickers.join(',');
+                setLoaderInput(tickerString);
+                // Option A: Just fill the form
+                // Option B: Auto trigger the load method immediately:
+                const loadRes = await fetch('/api/data-loader/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tickers: cachedTickers })
+                });
+                const data = await loadRes.json();
+                if (loadRes.ok) {
+                    setLoadedTickers(prev => {
+                        const existingMap = new Map(prev.map(item => [item.ticker, item]));
+                        data.forEach(item => existingMap.set(item.ticker, item));
+                        return Array.from(existingMap.values());
+                    });
+                    setLoaderInput('');
+                } else {
+                    alert("Error loading cache: " + data.error);
+                }
+            } else {
+                alert("No cached CSV files found in 'Quant backtest stock data'.");
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Failed to read cache map");
+        }
+        setIsCacheLoading(false);
+    };
+
+    const removeLoadedTicker = (tic) => {
+        setLoadedTickers(prev => prev.filter(t => t.ticker !== tic));
+    };
+
     return (
         <div className="p-4 bg-gray-900 min-h-screen text-white">
             <h2 className="text-2xl font-bold mb-4 text-emerald-400">Quant Score Parameters Backtest</h2>
 
+            {/* Ticker Data Loader Section */}
+            <div className="bg-gray-800 p-4 rounded-lg shadow-lg mb-6">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-semibold flex items-center gap-2">
+                        <span>📝 Watchlist / Data Loader</span>
+                        <span className="text-sm bg-gray-700 text-gray-300 px-2 py-1 rounded-full">{loadedTickers.length} tickers</span>
+                    </h3>
+                </div>
+
+                <form onSubmit={handleLoadTickers} className="flex gap-2 mb-4">
+                    <div className="flex-1 bg-gray-700 rounded-md border border-gray-600 focus-within:border-blue-500 overflow-hidden">
+                        <input
+                            type="text"
+                            placeholder="Enter Tickers (comma separated) e.g. AAPL, MSFT, GOOGL, TSLA"
+                            className="w-full bg-transparent text-white px-4 py-3 focus:outline-none"
+                            value={loaderInput}
+                            onChange={(e) => setLoaderInput(e.target.value)}
+                        />
+                    </div>
+                    <div className="flex gap-2">
+                        <button type="submit" disabled={isLoaderLoading || isCacheLoading} className="bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 border border-blue-500 disabled:border-gray-600 px-6 py-3 font-bold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap">
+                            {isLoaderLoading ? 'Processing...' : '+ Fetch & Append CSV'}
+                        </button>
+                        <button type="button" onClick={handleLoadCache} disabled={isLoaderLoading || isCacheLoading} className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 border border-emerald-500 disabled:border-gray-600 px-6 py-3 font-bold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap">
+                            {isCacheLoading ? 'Reading local files...' : 'Load Saved CSVs'}
+                        </button>
+                    </div>
+                </form>
+
+                {loadedTickers.length > 0 && (
+                    <div className="overflow-x-auto w-full">
+                        <table className="w-full text-sm text-center">
+                            <thead className="text-xs text-gray-400 uppercase bg-gray-900 border-b border-gray-700 whitespace-nowrap">
+                                <tr>
+                                    <th className="px-3 py-3 font-semibold text-left">Ticker</th>
+                                    <th className="px-3 py-3 font-semibold text-emerald-400">Score ▼</th>
+                                    <th className="px-3 py-3 font-semibold">Price</th>
+                                    <th className="px-3 py-3 font-semibold">% Chg</th>
+                                    <th className="px-3 py-3 font-semibold">RVol</th>
+                                    <th className="px-3 py-3 font-semibold">RS</th>
+                                    <th className="px-3 py-3 font-semibold">RS Δ</th>
+                                    <th className="px-3 py-3 font-semibold">10E</th>
+                                    <th className="px-3 py-3 font-semibold">20E</th>
+                                    <th className="px-3 py-3 font-semibold">50E</th>
+                                    <th className="px-3 py-3 font-semibold">Proj Vol (M)</th>
+                                    <th className="px-3 py-3 font-semibold">vwap</th>
+                                    <th className="px-3 py-3 font-semibold">VCP</th>
+                                    <th className="px-3 py-3 ">Appended</th>
+                                    <th className="px-3 py-3 font-semibold">Remove</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-800">
+                                {loadedTickers.sort((a, b) => b.score - a.score).map((row) => (
+                                    <tr key={row.ticker} className="hover:bg-gray-700 bg-gray-800 transition-colors group">
+                                        <td className="px-3 py-2 font-bold text-left text-white">{row.ticker}</td>
+                                        <td className="px-3 py-2 text-emerald-400 font-bold bg-green-900/20">{row.score}</td>
+                                        <td className="px-3 py-2 text-gray-200">{row.price}</td>
+                                        <td className={`px-3 py-2 font-medium ${parseFloat(row.percentChange) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.percentChange}%</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.rVol) > 1.5 ? 'text-green-400 font-bold' : 'text-red-400'}`}>{row.rVol}</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.rs) > 1 ? 'text-green-400 font-bold' : 'text-gray-400'}`}>{row.rs}x</td>
+                                        <td className="px-3 py-2 text-green-400">{row.rsDelta}%</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.e10) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e10}</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.e20) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e20}</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.e50) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e50}</td>
+                                        <td className="px-3 py-2 text-gray-300">{row.projVol}M</td>
+                                        <td className="px-3 py-2 text-gray-300">${row.vwap}</td>
+                                        <td className="px-3 py-2 text-yellow-400 font-medium">{row.vcp}</td>
+                                        <td className="px-3 py-2 text-gray-400 text-xs whitespace-nowrap">+{row.newRowsAppended} rows</td>
+                                        <td className="px-3 py-2">
+                                            <button onClick={() => removeLoadedTicker(row.ticker)} className="text-gray-500 hover:text-white bg-gray-700 hover:bg-gray-600 rounded px-2 py-1 transition-colors">
+                                                ✕
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left Panel: Controls */}
                 <div className="w-full md:w-1/3 bg-gray-800 p-4 rounded-lg shadow-lg">
-                    <h3 className="text-xl font-semibold mb-2">Backtest Universe</h3>
-                    <form onSubmit={handleAddTicker} className="flex gap-2 mb-4">
-                        <input
-                            type="text"
-                            placeholder="Add Ticker..."
-                            className="flex-1 bg-gray-700 text-white rounded px-3 py-2 border border-gray-600 focus:outline-none focus:border-emerald-500"
-                            value={newTickerInput}
-                            onChange={(e) => setNewTickerInput(e.target.value)}
-                        />
-                        <button type="submit" className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-white font-medium">Add</button>
-                    </form>
-                    <div className="flex flex-wrap gap-2 mb-4">
-                        {backtestTickers.map(ticker => (
-                            <span key={ticker} className="bg-gray-700 px-3 py-1 rounded-full text-sm flex items-center gap-2">
-                                {ticker}
-                                <button onClick={() => handleRemoveTicker(ticker)} className="text-red-400 hover:text-red-300 font-bold">&times;</button>
-                            </span>
-                        ))}
-                    </div>
                     <button
                         onClick={runBacktest}
-                        disabled={loading || backtestTickers.length === 0}
+                        disabled={loading || loadedTickers.length === 0}
                         className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 px-4 py-3 rounded text-white font-bold text-lg mb-6 shadow-md transition-colors"
                     >
-                        {loading ? 'Crunching 4 Years of Data...' : 'Run Historical Backtest'}
+                        {loading ? 'Crunching 4 Years of Data...' : 'Run Historical Backtest on Watchlist'}
                     </button>
 
                     <h3 className="text-xl font-semibold mb-2 mt-6">Chart Controls</h3>
