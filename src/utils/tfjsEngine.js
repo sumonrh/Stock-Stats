@@ -598,18 +598,25 @@ export const prepareIntradayData = async (intradayDataByDate, processedYfData, m
 
 export const createIntradayLstmModel = (sequenceLength) => {
     const model = tf.sequential();
-    model.add(tf.layers.lstm({
-        units: 32,
-        returnSequences: true,
-        inputShape: [sequenceLength, 2]
-    }));
-    model.add(tf.layers.dropout({ rate: 0.2 }));
 
-    model.add(tf.layers.lstm({
-        units: 16,
-        returnSequences: false
-    }));
-    model.add(tf.layers.dropout({ rate: 0.2 }));
+    if (sequenceLength > 1) {
+        model.add(tf.layers.lstm({
+            units: 32,
+            returnSequences: true,
+            inputShape: [sequenceLength, 2]
+        }));
+        model.add(tf.layers.dropout({ rate: 0.2 }));
+
+        model.add(tf.layers.lstm({
+            units: 16,
+            returnSequences: false
+        }));
+        model.add(tf.layers.dropout({ rate: 0.2 }));
+    } else {
+        // For a single bar (sequenceLength=1), LSTMs are not ideal. 
+        // A dense layer is more appropriate and avoids potential issues with single-step sequences in stacked LSTMs.
+        model.add(tf.layers.flatten({ inputShape: [sequenceLength, 2] }));
+    }
 
     model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
     model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
@@ -1243,4 +1250,3 @@ export const predictMaxExcursion = async (model, normParams, featureVector, acti
     const predictedExc = predVal * (labelMax - labelMin) + labelMin;
     return Math.max(0, predictedExc);
 };
-
