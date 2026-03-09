@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { trainQuantModel, predictFutureReturn } from '../utils/quantLstmModel';
 
-export default function QuantModelTrainer({ backtestData }) {
+export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
     const [training, setTraining] = useState(false);
     const [targetFeature, setTargetFeature] = useState('ret1W');
     const [epochs, setEpochs] = useState(50);
@@ -150,6 +150,20 @@ export default function QuantModelTrainer({ backtestData }) {
                         </div>
                     )}
 
+                    {/* Model Metrics */}
+                    {modelData && typeof modelData.mae !== 'undefined' && (
+                        <div className="bg-gray-700 p-4 rounded mt-4 border border-gray-600 flex justify-between items-center">
+                            <div>
+                                <p className="text-xs text-gray-400">Mean Abs Error (MAE)</p>
+                                <p className="text-lg font-bold text-emerald-400">{modelData.mae.toFixed(2)}%</p>
+                            </div>
+                            <div className="border-l border-gray-600 pl-4">
+                                <p className="text-xs text-gray-400">Accuracy (R²)</p>
+                                <p className="text-lg font-bold text-blue-400">{typeof modelData.rSquared === 'number' ? (modelData.rSquared * 100).toFixed(2) + '%' : 'N/A'}</p>
+                            </div>
+                        </div>
+                    )}
+
                     {/* Sensitivity Analysis Box */}
                     {modelData && modelData.sensitivity && (
                         <div className="bg-gray-700 p-4 rounded mt-4 border border-gray-600">
@@ -170,9 +184,15 @@ export default function QuantModelTrainer({ backtestData }) {
 
                             <div className="bg-gray-800 p-3 rounded border border-gray-600">
                                 <h6 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Optimum Equation Formula</h6>
-                                <p className="font-mono text-sm text-yellow-300 break-words">
+                                <p className="font-mono text-sm text-yellow-300 break-words mb-2">
                                     {generateEquation(modelData.sensitivity)}
                                 </p>
+                                <button
+                                    onClick={() => onApplyAiFormula(modelData.sensitivity, modelData.stats)}
+                                    className="text-xs bg-emerald-600 hover:bg-emerald-500 px-2 py-1 rounded font-bold transition-colors"
+                                >
+                                    Apply Weights as AI Score
+                                </button>
                             </div>
                         </div>
                     )}

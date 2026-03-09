@@ -37,6 +37,7 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
 
     const featureKeys = [
         'rsDelta',
+        'rs',
         'vcp',
         'rVol',
         'priceChangeOverAdr',
@@ -66,6 +67,8 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
     stats.target = { mean: targetMean, std: targetStd };
 
     const normalize = (val, mean, std) => {
+        // Handle NaN/null/undefined explicitly to prevent model training explosions
+        if (typeof val !== 'number' || isNaN(val)) val = 0;
         // Robust scaling: clip extreme outliers (+/- 5 standard deviations) to prevent model explosion
         const z = (val - mean) / std;
         return Math.max(-5, Math.min(5, z));
@@ -85,7 +88,10 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
             // We want features up to day `i` to predict forward return from day `i`
             for (let j = sequenceLength - 1; j >= 0; j--) {
                 const stepRow = rows[i - j];
-                const featureVector = featureKeys.map(key => normalize(stepRow[key], stats[key].mean, stats[key].std));
+                const featureVector = featureKeys.map(key => {
+                    const val = stepRow[key] != null ? stepRow[key] : 0;
+                    return normalize(val, stats[key].mean, stats[key].std);
+                });
                 seq.push(featureVector);
             }
             sequences.push(seq);
@@ -177,6 +183,30 @@ export const trainQuantModel = async (backtestData, targetFeature, sequenceLengt
     // Run custom sensitivity analysis after training
     const sensitivity = await runSensitivityAnalysis(model, xs, ys, featureKeys);
 
+    // Calculate MAE and R^2 natively
+    const allPredsTensor = model.predict(xs);
+    const allPredsArray = await allPredsTensor.data();
+    const ysArray = await ys.data();
+
+    // De-normalize the ys to calculate actual MAE in % return terms
+    const denormYs = Array.from(ysArray).map(v => v * stats.target.std + stats.target.mean);
+    const denormPreds = Array.from(allPredsArray).map(v => v * stats.target.std + stats.target.mean);
+
+    let absErrorSum = 0;
+    const meanY = denormYs.reduce((a, b) => a + b, 0) / denormYs.length;
+    let ssTot = 0;
+    let ssRes = 0;
+
+    for (let i = 0; i < denormYs.length; i++) {
+        absErrorSum += Math.abs(denormYs[i] - denormPreds[i]);
+        ssTot += Math.pow(denormYs[i] - meanY, 2);
+        ssRes += Math.pow(denormYs[i] - denormPreds[i], 2);
+    }
+
+    const mae = absErrorSum / denormYs.length;
+    const rSquared = ssTot > 0 ? 1 - (ssRes / ssTot) : 0;
+
+    allPredsTensor.dispose();
     xs.dispose();
     ys.dispose();
 
@@ -187,7 +217,9 @@ export const trainQuantModel = async (backtestData, targetFeature, sequenceLengt
         targetFeature,
         sequenceLength,
         sensitivity,
-        finalEpoch
+        finalEpoch,
+        mae,
+        rSquared
     };
 };
 

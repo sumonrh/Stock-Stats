@@ -1,0 +1,6 @@
+1:import * as tf from '@tensorflow/tfjs';
+173:const xs = tf.tensor3d(flatSequences, [sequences.length, sequenceLength, numFeatures]);
+174:const ys = tf.tensor2d(flatTargets, [targets.length, 1]);
+227:const evalXs = tf.tensor3d(flatEvalXs, [evalXsArray.length, sequenceLength, numFeatures]);
+287:const inputTensor = tf.tensor3d(flatSeq, [1, sequenceLength, numFeatures]);
+331:const maskedXs = tf.tensor3d(maskedData, [numSamples, seqLength, numFeatures]);

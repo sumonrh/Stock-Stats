@@ -90,6 +90,73 @@ const processTickerData = (data, ticker, rvolPeriod, adrPeriod) => {
   return result;
 };
 
+// --- DATA PROCESSING WITH RS ---
+const processTickerDataWithRs = (data, ticker, rvolPeriod, adrPeriod, spyData) => {
+  const result = [];
+  const maxDaysNeeded = Math.max(rvolPeriod, adrPeriod, 252); // Ensure we have enough for RS weighting
+
+  // Build a fast lookup for SPY closes by date
+  const spyMap = {};
+  for (const s of spyData) {
+    const dStr = typeof s.date === 'string' ? s.date.split('T')[0] : s.date.toISOString().split('T')[0];
+    spyMap[dStr] = s.close;
+  }
+
+  for (let i = 0; i < data.length; i++) {
+    let current = { ...data[i], ticker };
+
+    // Absolute maximum excursion from open (either high or low)
+    const highExcursion = Math.abs(current.high - current.open);
+    const lowExcursion = Math.abs(current.low - current.open);
+    current.maxAbsoluteExcursion = Math.max(highExcursion, lowExcursion);
+
+    // Calculate rolling averages and RS
+    if (i >= maxDaysNeeded) {
+      const getStockRet = (days) => {
+        const oldPrice = data[i - days].close;
+        return oldPrice ? ((data[i].close - oldPrice) / oldPrice) * 100 : 0;
+      };
+
+      const getSpyRet = (days) => {
+        const dateNow = typeof data[i].date === 'string' ? data[i].date.split('T')[0] : data[i].date.toISOString().split('T')[0];
+        const dateOld = typeof data[i - days].date === 'string' ? data[i - days].date.split('T')[0] : data[i - days].date.toISOString().split('T')[0];
+        const spyNow = spyMap[dateNow];
+        const spyOld = spyMap[dateOld];
+        return (spyNow && spyOld) ? ((spyNow - spyOld) / spyOld) * 100 : 0;
+      };
+
+      const stockWeights = (1 + getStockRet(63) / 100) * 0.4 + (1 + getStockRet(126) / 100) * 0.2 + (1 + getStockRet(189) / 100) * 0.2 + (1 + getStockRet(252) / 100) * 0.2;
+      const spyWeights = (1 + getSpyRet(63) / 100) * 0.4 + (1 + getSpyRet(126) / 100) * 0.2 + (1 + getSpyRet(189) / 100) * 0.2 + (1 + getSpyRet(252) / 100) * 0.2;
+
+      current.rsRating = spyWeights > 0 ? stockWeights / spyWeights : 1.0;
+
+      let volSum = 0;
+      let adrDollarSum = 0;
+
+      for (let j = 1; j <= rvolPeriod; j++) {
+        volSum += data[i - j].volume;
+      }
+      for (let j = 1; j <= adrPeriod; j++) {
+        adrDollarSum += (data[i - j].high - data[i - j].low);
+      }
+
+      current.avgVol = volSum / rvolPeriod;
+      current.adrDollar = adrDollarSum / adrPeriod;
+
+      if (current.adrDollar > 0 && current.avgVol > 0) {
+        current.rVol = current.volume / current.avgVol;
+        current.maxExcursionAdr = current.maxAbsoluteExcursion / current.adrDollar;
+        current.dateStr = typeof current.date === 'string' ? current.date.split('T')[0] : current.date.toISOString().split('T')[0];
+
+        if (current.rVol < 25 && current.maxExcursionAdr < 15) {
+          result.push(current);
+        }
+      }
+    }
+  }
+  return result;
+};
+
 
 
 // --- MAIN COMPONENT ---
@@ -142,6 +209,7 @@ export default function App() {
   const [selectedMaxExcTicker, setSelectedMaxExcTicker] = useState('ALL');
   const [maxExcMinutes, setMaxExcMinutes] = useState(5);
   const [maxExcDailyFeatures, setMaxExcDailyFeatures] = useState({});
+  const [spyData, setSpyData] = useState([]);
   const [manualMaxExcInput, setManualMaxExcInput] = useState({ open: '', volume: '' });
   const [maxExcPrediction, setMaxExcPrediction] = useState(null);
   const [enabledFeatures, setEnabledFeatures] = useState(
@@ -162,10 +230,28 @@ export default function App() {
   const loadInitialData = async () => {
     setLoading(true);
 
+    // Fetch available tickers from cache
+    let cachedTickers = [];
+    try {
+      const cacheRes = await fetch('/api/data-loader/cache');
+      if (cacheRes.ok) {
+        cachedTickers = await cacheRes.json();
+      }
+    } catch (e) { console.error("Failed to load cached tickers", e); }
+
+    let tickersToUse = cachedTickers.length > 0 ? cachedTickers : INITIAL_TICKERS;
+    setAvailableTickers(tickersToUse);
+    setSelectedTickerFilter(tickersToUse[0] || 'ALL');
+
     // Only load the very first ticker on initial startup to improve load speeds
-    const firstTicker = INITIAL_TICKERS[0];
+    const firstTicker = tickersToUse[0];
     const newRawData = {};
-    newRawData[firstTicker] = await fetchRawTickerData(firstTicker);
+    if (firstTicker) {
+      newRawData[firstTicker] = await fetchRawTickerData(firstTicker);
+    }
+
+    const spyRaw = await fetchRawTickerData('SPY');
+    setSpyData(spyRaw);
 
     setRawMarketData(newRawData);
     setLoading(false);
@@ -340,6 +426,18 @@ export default function App() {
     }
 
     setLoading(true);
+
+    // Append to CSV in Quant backtester stock data
+    try {
+      await fetch('/api/data-loader/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tickers: [symbol] })
+      });
+    } catch (e) {
+      console.error("Failed to append CSV", e);
+    }
+
     const rawData = await fetchRawTickerData(symbol);
 
     setAvailableTickers(prev => prev.includes(symbol) ? prev : [...prev, symbol]);
@@ -353,7 +451,11 @@ export default function App() {
   const getProcessedData = (marketData) => {
     let allProcessed = [];
     for (const [ticker, rawData] of Object.entries(marketData)) {
-      allProcessed = allProcessed.concat(processTickerData(rawData, ticker, rvolPeriod, adrPeriod));
+      if (spyData && spyData.length > 0) {
+        allProcessed = allProcessed.concat(processTickerDataWithRs(rawData, ticker, rvolPeriod, adrPeriod, spyData));
+      } else {
+        allProcessed = allProcessed.concat(processTickerData(rawData, ticker, rvolPeriod, adrPeriod));
+      }
     }
     return allProcessed;
   };
@@ -520,7 +622,15 @@ export default function App() {
     try {
       // dynamic import for tf to avoid making App.jsx fully dependent on tfjs tree statically
       const tf = await import('@tensorflow/tfjs');
-      const inputTensor = tf.tensor3d([simulatedSequence]);
+      const numFeatures = 3;
+      const seqLength = simulatedSequence.length;
+      const flatSeq = new Float32Array(seqLength * numFeatures);
+      for (let i = 0; i < seqLength; i++) {
+        flatSeq[i * numFeatures] = simulatedSequence[i][0];
+        flatSeq[i * numFeatures + 1] = simulatedSequence[i][1];
+        flatSeq[i * numFeatures + 2] = simulatedSequence[i][2];
+      }
+      const inputTensor = tf.tensor3d(flatSeq, [1, seqLength, numFeatures]);
       const predTensor = aiResults.model.predict(inputTensor);
       const predVal = (await predTensor.data())[0];
 
@@ -537,24 +647,24 @@ export default function App() {
 
   // Intraday Handlers
   const handleTrainIntraday = async () => {
-    const currentIntraday = await ensureIntradayData(selectedIntradayTicker);
-
-    // Make sure the daily data is available for those tickers so we have avgVol
-    const tickersToEnsure = selectedIntradayTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedIntradayTicker];
-    const updatedRawData = { ...rawMarketData };
-    for (const ticker of tickersToEnsure) {
-      if (!updatedRawData[ticker]) {
-        updatedRawData[ticker] = await fetchRawTickerData(ticker);
-      }
-    }
-    setRawMarketData(updatedRawData);
-
-    setIsIntradayLoading(true); // Ensure UI loading state if we just fetched
-    setIsIntradayTraining(true);
-    setIntradayAiResults(null);
-    setManualIntradayResult(null);
-
     try {
+      setIsIntradayLoading(true);
+      const currentIntraday = await ensureIntradayData(selectedIntradayTicker);
+
+      const tickersToEnsure = selectedIntradayTicker === 'ALL' ? intradayFiles.map(f => f.ticker) : [selectedIntradayTicker];
+      const updatedRawData = { ...rawMarketData };
+
+      for (const ticker of tickersToEnsure) {
+        if (!updatedRawData[ticker]) {
+          updatedRawData[ticker] = await fetchRawTickerData(ticker);
+        }
+      }
+      setRawMarketData(updatedRawData);
+
+      setIsIntradayTraining(true);
+      setIntradayAiResults(null);
+      setManualIntradayResult(null);
+
       let intradayListToUse = [];
       if (selectedIntradayTicker === 'ALL') {
         for (const key of Object.keys(currentIntraday)) {
@@ -576,11 +686,19 @@ export default function App() {
           setIntradayTrainLoss(loss);
         }
       );
-      setIntradayAiResults(results);
+
+      if (!results) {
+        alert("No valid overlapping date ranges found between Intraday CSVs and Daily Market Data. Ensure both datasets cover the same time periods.");
+      } else {
+        setIntradayAiResults(results);
+      }
     } catch (err) {
       console.error("Intraday AI Training Error", err);
+      alert("Failed to train intraday model: " + err.message);
+    } finally {
+      setIsIntradayLoading(false);
+      setIsIntradayTraining(false);
     }
-    setIsIntradayTraining(false);
   };
 
   const handlePredictIntraday = async () => {
@@ -604,15 +722,22 @@ export default function App() {
     const tickerToFind = isIndividualStock ? selectedIntradayTicker : (selectedTickerFilter !== 'ALL' ? selectedTickerFilter : null);
 
     let avgVolFallback = 1000000;
+    let rsFallback = 1.0;
     if (tickerToFind) {
       const match = processedData.filter(d => d.ticker === tickerToFind);
-      if (match.length > 0) avgVolFallback = match[match.length - 1].avgVol;
+      if (match.length > 0) {
+        avgVolFallback = match[match.length - 1].avgVol;
+        rsFallback = match[match.length - 1].rsRating || 1.0;
+      }
     } else {
-      if (fallbacks.length > 0) avgVolFallback = fallbacks[fallbacks.length - 1].avgVol;
+      if (fallbacks.length > 0) {
+        avgVolFallback = fallbacks[fallbacks.length - 1].avgVol;
+        rsFallback = fallbacks[fallbacks.length - 1].rsRating || 1.0;
+      }
     }
 
     try {
-      const res = await evaluateIntradayModel(intradayAiResults.model, intradayAiResults.preparedData, parts, avgVolFallback);
+      const res = await evaluateIntradayModel(intradayAiResults.model, intradayAiResults.preparedData, parts, avgVolFallback, rsFallback);
       setManualIntradayResult({
         rvol: res,
         predictedVolume: res * avgVolFallback,
@@ -1565,9 +1690,9 @@ export default function App() {
                     </datalist>
                     <button
                       type="submit"
-                      className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-r-md transition-colors text-sm"
+                      className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-r-md transition-colors text-sm whitespace-nowrap"
                     >
-                      Fetch
+                      Add Data
                     </button>
                   </div>
                   <select
@@ -1708,6 +1833,10 @@ export default function App() {
                         {historicalRegression && aiRegression && aiRegression.r2 > historicalRegression.r2 && (
                           <div className="absolute -top-2 -right-2 bg-green-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow">WINS</div>
                         )}
+                      </div>
+                      <div className="bg-white p-3 rounded shadow-sm flex flex-col items-center min-w-[120px]">
+                        <span className="text-xs text-slate-500 font-bold uppercase text-center">Mean Abs Error</span>
+                        <span className="text-lg font-mono text-emerald-600 font-semibold">{aiResults && aiResults.mae !== undefined ? aiResults.mae.toFixed(4) : 'N/A'}</span>
                       </div>
                     </div>
                   </div>
@@ -2170,6 +2299,14 @@ export default function App() {
                       <span className="block text-xs text-indigo-700 font-bold uppercase mb-1">R-Squared (R²)</span>
                       <span className="block text-lg font-mono font-bold text-indigo-900">{intradayAiResults.rSquared !== undefined ? intradayAiResults.rSquared.toFixed(3) : 'N/A'}</span>
                     </div>
+                    <div className="bg-emerald-50 p-3 rounded-lg border border-emerald-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-emerald-700 font-bold uppercase mb-1">Mean Abs Error</span>
+                      <span className="block text-lg font-mono font-bold text-emerald-900">
+                        {intradayAiResults.mae !== undefined ?
+                          (intradayAiResults.mae >= 1000000 ? `${(intradayAiResults.mae / 1000000).toFixed(2)}M` : `${(intradayAiResults.mae / 1000).toFixed(0)}k`)
+                          : 'N/A'}
+                      </span>
+                    </div>
                     <div className="bg-blue-50 p-3 rounded-lg border border-blue-100 text-center min-w-[120px]">
                       <span className="block text-xs text-blue-700 font-bold uppercase mb-1">Standard Dev</span>
                       <span className="block text-lg font-mono font-bold text-blue-900">
@@ -2492,6 +2629,10 @@ export default function App() {
                     <div className="bg-emerald-50 p-3 rounded-lg border border-emerald-100 text-center min-w-[120px]">
                       <span className="block text-xs text-emerald-700 font-bold uppercase mb-1">R²</span>
                       <span className="block text-lg font-mono font-bold text-emerald-900">{maxExcResults.rSquared.toFixed(3)}</span>
+                    </div>
+                    <div className="bg-teal-50 p-3 rounded-lg border border-teal-100 text-center min-w-[120px]">
+                      <span className="block text-xs text-teal-700 font-bold uppercase mb-1">MAE</span>
+                      <span className="block text-lg font-mono font-bold text-teal-900">{maxExcResults.mae?.toFixed(4) || 'N/A'}</span>
                     </div>
                     <div className="bg-amber-50 p-3 rounded-lg border border-amber-100 text-center min-w-[120px]">
                       <span className="block text-xs text-amber-700 font-bold uppercase mb-1">MSE</span>

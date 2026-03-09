@@ -23,6 +23,7 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
     const [yAxisMetric, setYAxisMetric] = useState('ret1W');
     const [colorMetric, setColorMetric] = useState('vcp');
     const [isCacheLoading, setIsCacheLoading] = useState(false);
+    const [aiFormula, setAiFormula] = useState(null); // { weights, stats }
 
 
 
@@ -49,14 +50,41 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
     };
 
     const scatterData = useMemo(() => {
-        return backtestData.map(d => ({
-            x: d[xAxisMetric],
-            y: d[yAxisMetric],
-            z: d[colorMetric],
-            ticker: d.ticker,
-            date: d.date
-        }));
-    }, [backtestData, xAxisMetric, yAxisMetric, colorMetric]);
+        return backtestData.map(d => {
+            let xVal = d[xAxisMetric];
+            if (xAxisMetric === 'aiScore' && aiFormula) {
+                // Calculate AI Score on the fly using normalized weights
+                const normalize = (val, mean, std) => {
+                    const s = std || 1;
+                    const z = (val - mean) / s;
+                    return Math.max(-5, Math.min(5, isNaN(z) ? 0 : z));
+                };
+                let score = 0;
+                aiFormula.weights.forEach(w => {
+                    const featVal = d[w.feature] || 0;
+                    const z = normalize(featVal, aiFormula.stats[w.feature]?.mean || 0, aiFormula.stats[w.feature]?.std || 1);
+                    score += (w.weight * z);
+                });
+                let bounded = 50 + (score / 4);
+                bounded = Math.max(0, Math.min(100, bounded));
+                xVal = Number(bounded.toFixed(2));
+            }
+
+            // Fallback for missing or non-numeric values to prevent empty charts
+            if (typeof xVal !== 'number' || isNaN(xVal)) {
+                // If it's RS, default to a neutral 1.0, otherwise 0
+                xVal = xAxisMetric === 'rs' ? 1.0 : 0;
+            }
+
+            return {
+                x: xVal,
+                y: d[yAxisMetric],
+                z: d[colorMetric],
+                ticker: d.ticker,
+                date: d.date
+            };
+        });
+    }, [backtestData, xAxisMetric, yAxisMetric, colorMetric, aiFormula]);
 
     const handleLoadTickers = async (e) => {
         e.preventDefault();
@@ -192,7 +220,7 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                         <td className="px-3 py-2 text-gray-200">{row.price}</td>
                                         <td className={`px-3 py-2 font-medium ${parseFloat(row.percentChange) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.percentChange}%</td>
                                         <td className={`px-3 py-2 ${parseFloat(row.rVol) > 1.5 ? 'text-green-400 font-bold' : 'text-red-400'}`}>{row.rVol}</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.rs) > 1 ? 'text-green-400 font-bold' : 'text-gray-400'}`}>{row.rs}x</td>
+                                        <td className={`px-3 py-2 ${parseFloat(row.rs) > 1 ? 'text-green-400 font-bold' : 'text-gray-400'}`}>{row.rs}</td>
                                         <td className="px-3 py-2 text-green-400">{row.rsDelta}%</td>
                                         <td className={`px-3 py-2 ${parseFloat(row.e10) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e10}</td>
                                         <td className={`px-3 py-2 ${parseFloat(row.e20) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e20}</td>
@@ -231,12 +259,15 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                             <label className="block text-sm text-gray-400 mb-1">X-Axis (Parameter)</label>
                             <select value={xAxisMetric} onChange={e => setXAxisMetric(e.target.value)} className="w-full bg-gray-700 rounded px-2 py-1.5 border border-gray-600">
                                 <option value="quantScore">Quant Score (0-100)</option>
+                                {aiFormula && <option value="aiScore" className="text-emerald-400 font-bold">AI Model Score (Optimum)</option>}
                                 <option value="rsDelta">RS Delta (1-Day Slope %)</option>
+                                <option value="rs">Relative Strength (1x-3x)</option>
                                 <option value="vcp">VCP Status (0=None, 3=High)</option>
                                 <option value="rVol">RVol (50-Day Avg)</option>
                                 <option value="priceChangeOverAdr">Daily Move / ADR ($ Ratio)</option>
                                 <option value="episodicPivotPower">Episodic Pivot Power (RVol * Move/ADR)</option>
                                 <option value="ema10DistAtr">Distance to 10EMA (ATR)</option>
+                                <option value="ema20DistAtr">Distance to 20EMA (ATR)</option>
                             </select>
                         </div>
                         <div>
@@ -289,7 +320,15 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
             </div>
 
             {/* Neural Network Model Trainer */}
-            {backtestData.length > 0 && <QuantModelTrainer backtestData={backtestData} />}
+            {backtestData.length > 0 && (
+                <QuantModelTrainer
+                    backtestData={backtestData}
+                    onApplyAiFormula={(weights, stats) => {
+                        setAiFormula({ weights, stats });
+                        setXAxisMetric('aiScore');
+                    }}
+                />
+            )}
 
             {/* Bottom Panel: Data Table */}
             {backtestData.length > 0 && (
@@ -302,12 +341,15 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                     <th className="px-4 py-3">Date</th>
                                     <th className="px-4 py-3">Ticker</th>
                                     <th className="px-4 py-3">Quant Score</th>
+                                    {aiFormula && <th className="px-4 py-3 text-emerald-400">AI Score</th>}
                                     <th className="px-4 py-3">RS Delta</th>
+                                    <th className="px-4 py-3 font-semibold text-emerald-400">RS</th>
                                     <th className="px-4 py-3">VCP</th>
                                     <th className="px-4 py-3">RVol</th>
                                     <th className="px-4 py-3">Move/ADR</th>
                                     <th className="px-4 py-3">EP Power</th>
                                     <th className="px-4 py-3">Dist 10EMA</th>
+                                    <th className="px-4 py-3">Dist 20EMA</th>
                                     <th className="px-4 py-3 text-right">1W Ret</th>
                                     <th className="px-4 py-3 text-right">2W Ret</th>
                                     <th className="px-4 py-3 text-right">1M Ret</th>
@@ -319,12 +361,35 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                         <td className="px-4 py-2">{row.date}</td>
                                         <td className="px-4 py-2 font-bold">{row.ticker}</td>
                                         <td className="px-4 py-2 text-emerald-400">{row.quantScore}</td>
+                                        {aiFormula && (
+                                            <td className="px-4 py-2 text-emerald-300 font-bold">
+                                                {(() => {
+                                                    const normalize = (val, mean, std) => {
+                                                        const s = std || 1;
+                                                        const z = (val - mean) / s;
+                                                        return Math.max(-5, Math.min(5, isNaN(z) ? 0 : z));
+                                                    };
+                                                    let score = 0;
+                                                    aiFormula.weights.forEach(w => {
+                                                        const featVal = row[w.feature] != null ? row[w.feature] : 0;
+                                                        const z = normalize(featVal, aiFormula.stats[w.feature]?.mean || 0, aiFormula.stats[w.feature]?.std || 1);
+                                                        score += (w.weight * z);
+                                                    });
+                                                    // Map bounded Z-score dynamically to a 0-100 continuum
+                                                    let bounded = 50 + (score / 4);
+                                                    bounded = Math.max(0, Math.min(100, bounded));
+                                                    return bounded.toFixed(1);
+                                                })()}
+                                            </td>
+                                        )}
                                         <td className="px-4 py-2">{row.rsDelta}</td>
+                                        <td className="px-4 py-2 text-emerald-300 font-bold">{row.rs}</td>
                                         <td className="px-4 py-2">{row.vcp}</td>
                                         <td className="px-4 py-2">{row.rVol}</td>
                                         <td className="px-4 py-2">{row.priceChangeOverAdr}</td>
                                         <td className="px-4 py-2 font-semibold text-purple-400">{row.episodicPivotPower}</td>
                                         <td className="px-4 py-2">{row.ema10DistAtr}</td>
+                                        <td className="px-4 py-2">{row.ema20DistAtr}</td>
                                         <td className={`px-4 py-2 text-right ${row.ret1W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1W}%</td>
                                         <td className={`px-4 py-2 text-right ${row.ret2W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret2W}%</td>
                                         <td className={`px-4 py-2 text-right ${row.ret1M >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1M}%</td>
