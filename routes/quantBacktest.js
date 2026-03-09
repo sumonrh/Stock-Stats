@@ -1,5 +1,6 @@
 import express from 'express';
 import yahooFinance from 'yahoo-finance2';
+import { QuantScorer } from './quantScorer.js';
 
 // We need a subset of logic from stock-scorer's calculateMetrics to compute over a history array.
 // For simplicity, we'll re-implement the rolling metric logic directly here specifically for 1d charts.
@@ -46,9 +47,10 @@ router.post('/run', async (req, res) => {
 
         // 1. Fetch SPY for RS Rating and VIX for weights
         const yf = new yahooFinance();
-        const [spyData, vixData] = await Promise.all([
+        const [spyData, vixData, vxvData] = await Promise.all([
             yf.chart('SPY', queryOptions).catch(() => null),
-            yf.chart('^VIX', queryOptions).catch(() => null)
+            yf.chart('^VIX', queryOptions).catch(() => null),
+            yf.chart('^VXV', queryOptions).catch(() => null)
         ]);
 
         if (!spyData || !spyData.quotes || spyData.quotes.length === 0) {
@@ -63,13 +65,23 @@ router.post('/run', async (req, res) => {
             }
         });
 
+        const vxvMap = {};
+        if (vxvData && vxvData.quotes) {
+            vxvData.quotes.forEach(q => {
+                if (q.date && q.close != null) {
+                    const dateStr = typeof q.date === 'string' ? q.date.split('T')[0] : q.date.toISOString().split('T')[0];
+                    vxvMap[dateStr] = q.close;
+                }
+            });
+        }
+
         const vixMap = {};
         if (vixData && vixData.quotes) {
             vixData.quotes.forEach((q, i) => {
                 if (q.date && q.close != null) {
                     const dateStr = typeof q.date === 'string' ? q.date.split('T')[0] : q.date.toISOString().split('T')[0];
                     const prevClose = i > 0 ? vixData.quotes[i - 1].close : q.open;
-                    vixMap[dateStr] = { price: q.close, previousClose: prevClose };
+                    vixMap[dateStr] = { price: q.close, vxvPrice: vxvMap[dateStr] || q.close, previousClose: prevClose };
                 }
             });
         }
@@ -222,29 +234,73 @@ router.post('/run', async (req, res) => {
                     };
                     const rsDelta = getLineSlope(i);
 
-                    // Simplified Quant Score (Composite of above features matching stock-scorer weights)
-                    // (dailyPerf: 0.07, strength: 0.11, accumulation: 0.14, pullback: 0.24, risk: 0.17, rsLineMomentum: 0.27)
-                    // For backtesting correlation, it's safer to use a simplified scalar 1-100 derived similarly to save heavy computation on 3 years of data.
-                    let quantScore = 50;
-                    if (percentChange > 0) quantScore += 5; else quantScore -= 5;
-                    quantScore += (rsRating - 1.0) * 20; // strength
-                    quantScore += vcp > 0 ? 5 : 0; // pullback/coiled
-                    quantScore += (rsDelta * 100); // momentum
-                    if (dist10 > 0 && dist20 > 0) quantScore += 10; // trend
-                    quantScore = Math.max(0, Math.min(100, quantScore));
+                    // UD Ratio (last 20 days)
+                    let upVol = 0, downVol = 0;
+                    for (let j = Math.max(1, i - 19); j <= i; j++) {
+                        if (closes[j] > closes[j - 1]) upVol += volumes[j];
+                        else if (closes[j] < closes[j - 1]) downVol += volumes[j];
+                    }
+                    const udRatio = downVol > 0 ? upVol / downVol : 5.0;
+
+                    // Percent ADR
+                    let ratioSum = 0;
+                    let ratioCount = 0;
+                    for (let j = Math.max(0, i - 19); j <= i; j++) {
+                        const l = lows[j] > 0 ? lows[j] : 1;
+                        ratioSum += (highs[j] / l);
+                        ratioCount++;
+                    }
+                    const avgRatio = ratioCount > 0 ? (ratioSum / ratioCount) : 1;
+                    const percentADR = (avgRatio - 1) * 100;
+
+                    const stockObj = {
+                        price: currentPrice,
+                        high: q.high,
+                        low: q.low,
+                        percentChange,
+                        rsRating,
+                        udRatio,
+                        percentADR,
+                        atr,
+                        distanceFrom10EMA: dist10,
+                        distanceFrom20EMA: dist20,
+                        distanceFrom50EMA: dist50,
+                        ema10: ema10[i],
+                        ema20: ema20[i],
+                        ema50: ema50[i],
+                        ema200: ema200[i] || 0,
+                        rsLineSlope: rsDelta,
+                        ema10Prev5: ema10[Math.max(0, i - 5)] || ema10[i],
+                        ema20Prev5: ema20[Math.max(0, i - 5)] || ema20[i],
+                        ema50Prev5: ema50[Math.max(0, i - 5)] || ema50[i],
+                    };
+
+                    const spyPrevItem = spyMap[quotes[i - 1].dateStr];
+                    const spyItem = spyMap[q.dateStr];
+                    const spyChg = (spyPrevItem && spyItem) ? ((spyItem - spyPrevItem) / spyPrevItem) * 100 : 0;
+
+                    const vixItem = vixMap[q.dateStr];
+
+                    const quantScore = QuantScorer.calculateScore(stockObj, vixItem, spyChg);
+
+                    const r1w = isFinite(ret1W) ? ret1W : 0;
+                    const r2w = isFinite(ret2W) ? ret2W : 0;
+                    const r1m = isFinite(ret1M) ? ret1M : 0;
+                    const rsVal = isFinite(rsRating) ? rsRating : 1.0;
 
                     allResults.push({
                         date: q.dateStr,
                         ticker,
                         quantScore: Number(quantScore.toFixed(0)),
                         rsDelta: Number((rsDelta * 100).toFixed(2)),
+                        rs: Number(rsVal.toFixed(2)),
                         vcp,
                         rVol: Number(rVol.toFixed(2)),
                         priceChangeOverAdr: Number(priceChangeOverAdr.toFixed(2)),
                         episodicPivotPower: Number(episodicPivotPower.toFixed(2)),
-                        ret1W: Number(ret1W.toFixed(2)),
-                        ret2W: Number(ret2W.toFixed(2)),
-                        ret1M: Number(ret1M.toFixed(2)),
+                        ret1W: Number(r1w.toFixed(2)),
+                        ret2W: Number(r2w.toFixed(2)),
+                        ret1M: Number(r1m.toFixed(2)),
                         ema10DistAtr: Number(dist10.toFixed(2)),
                         ema20DistAtr: Number(dist20.toFixed(2))
                     });

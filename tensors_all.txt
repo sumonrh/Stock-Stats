@@ -1,0 +1,17 @@
+1:import * as tf from '@tensorflow/tfjs';
+170:const xs = tf.tensor3d(flatTrainXs, [trainXsArray.length, SEQ_LENGTH, numFeatures]);
+171:const ys = tf.tensor2d(trainYsArray, [trainYsArray.length, 1]);
+220:const testXs = tf.tensor3d(flatTestXs, [testXsArray.length, SEQ_LENGTH, numFeatures]);
+221:const ysTest = tf.tensor2d(prepared.labels.slice(splitIdx), [testXsArray.length, 1]);
+317:const xs = tf.tensor3d(flatInputs, [inputs.length, SEQ_LENGTH, numFeatures]);
+679:// Explicitly flatten the arrays to completely bypass TFJS's internal nested-array stack inference loops
+680:// which can throw "Argument tensors passed to stack" errors in certain browser builds.
+692:xs = tf.tensor3d(flatInputs, [prepared.inputs.length, sequenceLength, 1]);
+699:ys = tf.tensor2d(flatLabels, [prepared.labels.length, 1]);
+825:const xs = tf.tensor3d(flatSeq, [1, sequenceLength, 1]);
+1064:const xs = tf.tensor2d(trainXsArray);
+1065:const ys = tf.tensor2d(trainYsArray);
+1111:const testXs = tf.tensor2d(testXsArray);
+1218:const baseXs = tf.tensor2d(evalInputs);
+1247:const shuffXs = tf.tensor2d(shuffled);
+1300:const xs = tf.tensor2d([normalized]);

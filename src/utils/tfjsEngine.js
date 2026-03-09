@@ -37,10 +37,12 @@ export const prepareTfjsData = (tickerData) => {
 
     const rawRVols = sorted.map(d => d.rVol);
     const rawExcursions = sorted.map(d => d.maxExcursionAdr);
+    const rawRS = sorted.map(d => d.rsRating || 1.0);
 
     const splitIdx = Math.floor(rawRVols.length * 0.8);
     const trainRVols = rawRVols.slice(0, splitIdx);
     const trainExcursions = rawExcursions.slice(0, splitIdx);
+    const trainRS = rawRS.slice(0, splitIdx);
 
     const rvolMin = trainRVols.reduce((m, v) => v < m ? v : m, Infinity);
     const rvolMax = trainRVols.reduce((m, v) => v > m ? v : m, -Infinity);
@@ -48,8 +50,12 @@ export const prepareTfjsData = (tickerData) => {
     const excMin = trainExcursions.reduce((m, v) => v < m ? v : m, Infinity);
     const excMax = trainExcursions.reduce((m, v) => v > m ? v : m, -Infinity);
 
+    const rsMin = trainRS.reduce((m, v) => (v < m ? v : m), Infinity);
+    const rsMax = trainRS.reduce((m, v) => (v > m ? v : m), -Infinity);
+
     const normRVols = rawRVols.map(v => rvolMax - rvolMin === 0 ? 0 : (v - rvolMin) / (rvolMax - rvolMin));
     const normExcursions = rawExcursions.map(v => excMax - excMin === 0 ? 0 : (v - excMin) / (excMax - excMin));
+    const normRS = rawRS.map(v => rsMax - rsMin === 0 ? 0 : (v - rsMin) / (rsMax - rsMin));
 
     const inputs = [];
     const labels = [];
@@ -59,9 +65,11 @@ export const prepareTfjsData = (tickerData) => {
     for (let i = SEQ_LENGTH; i < sorted.length; i++) {
         const sequence = [];
         for (let j = i - SEQ_LENGTH; j < i; j++) {
-            sequence.push([normRVols[j], normExcursions[j], 0]);
+            sequence.push([normRVols[j], normExcursions[j], normRS[j]]);
         }
-        sequence[SEQ_LENGTH - 1][2] = normRVols[i];
+        // Incorporate today's available info into the last step of the sequence
+        // We use today's RVol and today's RS to predict today's Excursion
+        sequence[SEQ_LENGTH - 1] = [normRVols[i], normRS[i], normExcursions[i - 1]];
 
         inputs.push(sequence);
         labels.push(normExcursions[i]);
@@ -78,6 +86,8 @@ export const prepareTfjsData = (tickerData) => {
         excMax,
         rvolMin,
         rvolMax,
+        rsMin,
+        rsMax,
         SEQ_LENGTH,
         // Save the very last sequence fully formed
         lastSequence: inputs.length > 0 ? inputs[inputs.length - 1].map(step => [step[0], step[1], step[2]]) : []
@@ -212,7 +222,22 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
         denormalizeValue(v, prepared.excMin, prepared.excMax)
     );
 
-    const mse = calculateMSE(denormPreds, testActuals);
+    const actuals = testActuals;
+    const preds = denormPreds;
+
+    let ssRes = 0;
+    let ssTot = 0;
+    let sumAbsErr = 0;
+    const meanActual = actuals.reduce((a, b) => a + b, 0) / actuals.length;
+
+    for (let i = 0; i < actuals.length; i++) {
+        ssRes += Math.pow(preds[i] - actuals[i], 2);
+        ssTot += Math.pow(actuals[i] - meanActual, 2);
+        sumAbsErr += Math.abs(preds[i] - actuals[i]);
+    }
+    const r2 = ssTot > 0 ? 1 - (ssRes / ssTot) : 0;
+    const mae = sumAbsErr / actuals.length;
+    const mse = ssRes / actuals.length;
 
     xs.dispose();
     ys.dispose();
@@ -230,6 +255,8 @@ export const runTfjsPipeline = async (tickerData, epochs = 50, onProgress = null
 
     return {
         mse,
+        mae,
+        rSquared: r2,
         predictionsMap,
         finalLoss,
         model, // return it in case we optionally want to run inference elsewhere
@@ -252,18 +279,16 @@ export const evaluateLstmOnData = async (model, preparedDataMeta, tickerData) =>
     // Normalize using existing meta boundaries!
     const normRVols = rawRVols.map(v => (v - preparedDataMeta.rvolMin) / (preparedDataMeta.rvolMax - preparedDataMeta.rvolMin));
     const normExcursions = rawExcursions.map(v => (v - preparedDataMeta.excMin) / (preparedDataMeta.excMax - preparedDataMeta.excMin));
+    const rawRS = sorted.map(d => d.rsRating || 1.0);
+    const normRS = rawRS.map(v => (v - preparedDataMeta.rsMin) / (preparedDataMeta.rsMax - preparedDataMeta.rsMin));
 
     const inputs = [];
     for (let i = SEQ_LENGTH; i < sorted.length; i++) {
         const sequence = [];
         for (let j = i - SEQ_LENGTH; j < i; j++) {
-            sequence.push([normRVols[j], normExcursions[j]]);
+            sequence.push([normRVols[j], normExcursions[j], normRS[j]]);
         }
-        const seqWithToday = sequence.map((step, idx) => {
-            if (idx === SEQ_LENGTH - 1) return [step[0], step[1], normRVols[i]];
-            return [step[0], step[1], 0];
-        });
-        inputs.push(seqWithToday);
+        inputs.push(sequence);
     }
 
     // Also update lastSequence
@@ -496,7 +521,7 @@ export const saveModelToServer = async (model, preparedData, modelType = 'daily'
  * intradayDataByDate: from backend /api/intraday-data
  * processedYfData: chartData inside App.jsx containing existing RVol features
  */
-export const prepareIntradayData = (intradayDataByDate, processedYfData, minutesToUse = 30) => {
+export const prepareIntradayData = async (intradayDataByDate, processedYfData, minutesToUse = 30) => {
     const maxBars = Math.floor(minutesToUse / 5);
 
     // Create a lookup for YF data by compound ticker & date string
@@ -512,8 +537,14 @@ export const prepareIntradayData = (intradayDataByDate, processedYfData, minutes
     const validDates = [];
     const sourcePoints = [];
 
+    let iteration = 0;
     for (const day of intradayDataByDate) {
-        if (!day.ticker) continue; // Safety check
+        iteration++;
+        if (iteration % 200 === 0) {
+            await tf.nextFrame(); // Yield every 200 days processed to unfreeze DOM
+        }
+
+        if (!day.ticker || !day.bars) continue; // Safety check
         const yfDay = yfMap[`${day.ticker}_${day.date}`];
         if (!yfDay) continue;
 
@@ -522,11 +553,22 @@ export const prepareIntradayData = (intradayDataByDate, processedYfData, minutes
         const avgVol = yfDay.avgVol;
         const actualRvol = yfDay.rVol;
 
+        // Ensure valid numbers
+        if (!Number.isFinite(avgVol) || avgVol <= 0 || !Number.isFinite(actualRvol)) continue;
+
         const sequence = [];
+        let validDay = true;
+        const dayRs = yfDay.rsRating || 1.0;
         for (let i = 0; i < maxBars; i++) {
-            // Feature: Volume of this 5-min bar relative to the 50-day Daily Average Volume
-            sequence.push([day.bars[i].volume / avgVol]);
+            const relVol = day.bars[i].volume / avgVol;
+            if (!Number.isFinite(relVol)) {
+                validDay = false;
+                break;
+            }
+            sequence.push([relVol, dayRs]);
         }
+
+        if (!validDay) continue;
 
         inputs.push(sequence);
         labels.push(actualRvol);
@@ -559,7 +601,7 @@ export const createIntradayLstmModel = (sequenceLength) => {
     model.add(tf.layers.lstm({
         units: 32,
         returnSequences: true,
-        inputShape: [sequenceLength, 1]
+        inputShape: [sequenceLength, 2]
     }));
     model.add(tf.layers.dropout({ rate: 0.2 }));
 
@@ -582,53 +624,67 @@ export const createIntradayLstmModel = (sequenceLength) => {
 };
 
 export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfData, minutesToUse = 30, epochs = 50, onProgress = null) => {
-    const prepared = prepareIntradayData(intradayDataByDate, processedYfData, minutesToUse);
+    const prepared = await prepareIntradayData(intradayDataByDate, processedYfData, minutesToUse);
     if (!prepared) return null;
 
     const sequenceLength = Math.floor(minutesToUse / 5);
-    const xs = tf.tensor3d(prepared.inputs);
-    const ys = tf.tensor2d(prepared.labels, [prepared.labels.length, 1]);
+    const flatInputs = new Float32Array(prepared.inputs.length * sequenceLength * 2);
+    for (let i = 0; i < prepared.inputs.length; i++) {
+        for (let j = 0; j < sequenceLength; j++) {
+            flatInputs[(i * sequenceLength + j) * 2] = prepared.inputs[i][j][0];
+            flatInputs[(i * sequenceLength + j) * 2 + 1] = prepared.inputs[i][j][1];
+        }
+    }
+    const flatLabels = new Float32Array(prepared.labels);
+
+    const xs = tf.tensor3d(flatInputs, [prepared.inputs.length, sequenceLength, 2]);
+    const ys = tf.tensor2d(flatLabels, [prepared.labels.length, 1]);
 
     const model = createIntradayLstmModel(sequenceLength);
 
     let finalLoss = 0;
     let currentEpoch = 0;
-    let bestValLoss = Infinity;
+    let bestLoss = Infinity;
     let waitCount = 0;
     let bestWeights = null;
 
-    await model.fit(xs, ys, {
-        epochs: epochs,
-        batchSize: 16,
-        shuffle: true,
-        validationSplit: 0.2,
-        callbacks: {
-            onEpochEnd: async (epoch, logs) => {
-                currentEpoch = epoch + 1;
-                finalLoss = logs.loss;
-                if (onProgress) {
-                    onProgress(currentEpoch, epochs, logs.loss);
-                }
+    try {
+        await model.fit(xs, ys, {
+            epochs: epochs,
+            batchSize: 16,
+            shuffle: true,
+            validationSplit: 0,
+            callbacks: {
+                onEpochEnd: async (epoch, logs) => {
+                    currentEpoch = epoch + 1;
+                    finalLoss = logs.loss;
+                    if (onProgress) {
+                        onProgress(currentEpoch, epochs, logs.loss);
+                    }
 
-                // --- Manual Early Stopping ---
-                if (logs.val_loss !== undefined) {
-                    if (logs.val_loss < bestValLoss) {
-                        bestValLoss = logs.val_loss;
-                        waitCount = 0;
-                        if (bestWeights) bestWeights.forEach(w => w.dispose());
-                        bestWeights = model.getWeights().map(w => w.clone());
-                    } else {
-                        waitCount++;
-                        if (waitCount >= 8) {
-                            model.stopTraining = true;
-                            console.log(`Intraday early stopping at epoch ${epoch + 1}`);
+                    // --- Manual Early Stopping on Training Loss ---
+                    if (logs.loss !== undefined) {
+                        if (logs.loss < bestLoss) {
+                            bestLoss = logs.loss;
+                            waitCount = 0;
+                            if (bestWeights) bestWeights.forEach(w => w.dispose());
+                            bestWeights = model.getWeights().map(w => w.clone());
+                        } else {
+                            waitCount++;
+                            if (waitCount >= 8) {
+                                model.stopTraining = true;
+                                console.log(`Intraday early stopping at epoch ${epoch + 1}`);
+                            }
                         }
                     }
+                    await tf.nextFrame();
                 }
-                await tf.nextFrame();
             }
-        }
-    });
+        });
+    } catch (e) {
+        console.error("TFJS Crash:", e);
+        throw new Error("Intraday TFJS Training crashed: " + e.message);
+    }
 
     if (bestWeights) {
         model.setWeights(bestWeights);
@@ -682,8 +738,15 @@ export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfDat
     const squaredDiffs = errors.map(e => Math.pow(e - meanError, 2));
     const stdDev = Math.sqrt(squaredDiffs.reduce((sum, sq) => sum + sq, 0) / errors.length);
 
+    let sumAbsErr = 0;
+    predictionsMap.forEach(p => {
+        sumAbsErr += Math.abs(p.predictedVol - p.actualVol);
+    });
+    const mae = sumAbsErr / predictionsMap.length;
+
     return {
         mse,
+        mae,
         rSquared,
         stdDev,
         predictionsMap,
@@ -693,10 +756,10 @@ export const runIntradayTfjsPipeline = async (intradayDataByDate, processedYfDat
     };
 };
 
-export const evaluateIntradayModel = async (model, preparedDataMeta, manualVolumes, avgVol) => {
-    let sequence = manualVolumes.map(vol => [vol / avgVol]);
+export const evaluateIntradayModel = async (model, preparedDataMeta, manualVolumes, avgVol, rsRating = 1.0) => {
+    let sequence = manualVolumes.map(vol => [vol / avgVol, rsRating]);
 
-    // We expect inputShape: [1, sequenceLength, 1]
+    // We expect inputShape: [1, sequenceLength, 2]
     const xs = tf.tensor3d([sequence]);
     const predsTensor = model.predict(xs);
     const predsArray = await predsTensor.data();
