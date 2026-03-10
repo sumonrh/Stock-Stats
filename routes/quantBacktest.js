@@ -10,6 +10,13 @@ const router = express.Router();
 // Helper functions (similar to lib.js from stock-scorer)
 const getMean = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
+const formatNumber = (num, digits = 2) => {
+    if (num === null || num === undefined || !isFinite(num)) {
+        return null;
+    }
+    return Number(num.toFixed(digits));
+};
+
 const calculateEMA = (values, period) => {
     const emas = new Array(values.length).fill(null);
     if (values.length < period) return emas;
@@ -155,16 +162,11 @@ router.post('/run', async (req, res) => {
                     const target2W = (i + 10 < quotes.length) ? quotes[i + 10].close : null;
                     const target1M = (i + 21 < quotes.length) ? quotes[i + 21].close : null;
 
-                    let ret1D = (target1D !== null && q.close) ? ((target1D - q.close) / q.close) * 100 : null;
-                    let ret1W = (target1W !== null && q.close) ? ((target1W - q.close) / q.close) * 100 : null;
-                    let ret2W = (target2W !== null && q.close) ? ((target2W - q.close) / q.close) * 100 : null;
-                    let ret1M = (target1M !== null && q.close) ? ((target1M - q.close) / q.close) * 100 : null;
-
-                    if (!isFinite(ret1D)) ret1D = null;
-                    if (!isFinite(ret1W)) ret1W = null;
-                    if (!isFinite(ret2W)) ret2W = null;
-                    if (!isFinite(ret1M)) ret1M = null;
-
+                    const ret1D = (target1D !== null && q.close) ? ((target1D - q.close) / q.close) * 100 : null;
+                    const ret1W = (target1W !== null && q.close) ? ((target1W - q.close) / q.close) * 100 : null;
+                    const ret2W = (target2W !== null && q.close) ? ((target2W - q.close) / q.close) * 100 : null;
+                    const ret1M = (target1M !== null && q.close) ? ((target1M - q.close) / q.close) * 100 : null;
+                    
                     if (ret1D === null && ret1W === null && ret2W === null && ret1M === null) {
                         continue;
                     }
@@ -294,24 +296,22 @@ router.post('/run', async (req, res) => {
 
                     const quantScore = QuantScorer.calculateScore(stockObj, vixItem, spyChg);
 
-                    const rsVal = isFinite(rsRating) ? rsRating : 1.0;
-
                     allResults.push({
                         date: q.dateStr,
                         ticker,
-                        quantScore: Number(quantScore.toFixed(0)),
-                        rsDelta: Number((rsDelta * 100).toFixed(2)),
-                        rs: Number(rsVal.toFixed(2)),
+                        quantScore: formatNumber(quantScore, 0),
+                        rsDelta: formatNumber(rsDelta * 100),
+                        rs: formatNumber(rsRating),
                         vcp,
-                        rVol: Number(rVol.toFixed(2)),
-                        priceChangeOverAdr: Number(priceChangeOverAdr.toFixed(2)),
-                        episodicPivotPower: Number(episodicPivotPower.toFixed(2)),
-                        ret1D: ret1D !== null ? Number(ret1D.toFixed(2)) : null,
-                        ret1W: ret1W !== null ? Number(ret1W.toFixed(2)) : null,
-                        ret2W: ret2W !== null ? Number(ret2W.toFixed(2)) : null,
-                        ret1M: ret1M !== null ? Number(ret1M.toFixed(2)) : null,
-                        ema10DistAtr: Number(dist10.toFixed(2)),
-                        ema20DistAtr: Number(dist20.toFixed(2))
+                        rVol: formatNumber(rVol),
+                        priceChangeOverAdr: formatNumber(priceChangeOverAdr),
+                        episodicPivotPower: formatNumber(episodicPivotPower),
+                        ret1D: formatNumber(ret1D),
+                        ret1W: formatNumber(ret1W),
+                        ret2W: formatNumber(ret2W),
+                        ret1M: formatNumber(ret1M),
+                        ema10DistAtr: formatNumber(dist10),
+                        ema20DistAtr: formatNumber(dist20)
                     });
                 }
             } catch (err) {
