@@ -146,17 +146,28 @@ router.post('/run', async (req, res) => {
                 }
 
                 // Evaluate over valid history (skip first 252 days to allow for 12-month RS Rating)
-                for (let i = 252; i < quotes.length - 21; i++) { // Leave 21 days for 1-month forward target
+                for (let i = 252; i < quotes.length; i++) { // Loop until the end, handle fwd returns inside
                     const q = quotes[i];
 
                     // --- Forward Returns ---
-                    const target1W = quotes[Math.min(i + 5, quotes.length - 1)].close;
-                    const target2W = quotes[Math.min(i + 10, quotes.length - 1)].close;
-                    const target1M = quotes[Math.min(i + 21, quotes.length - 1)].close;
+                    const target1D = (i + 1 < quotes.length) ? quotes[i + 1].close : null;
+                    const target1W = (i + 5 < quotes.length) ? quotes[i + 5].close : null;
+                    const target2W = (i + 10 < quotes.length) ? quotes[i + 10].close : null;
+                    const target1M = (i + 21 < quotes.length) ? quotes[i + 21].close : null;
 
-                    const ret1W = ((target1W - q.close) / q.close) * 100;
-                    const ret2W = ((target2W - q.close) / q.close) * 100;
-                    const ret1M = ((target1M - q.close) / q.close) * 100;
+                    let ret1D = (target1D !== null && q.close) ? ((target1D - q.close) / q.close) * 100 : null;
+                    let ret1W = (target1W !== null && q.close) ? ((target1W - q.close) / q.close) * 100 : null;
+                    let ret2W = (target2W !== null && q.close) ? ((target2W - q.close) / q.close) * 100 : null;
+                    let ret1M = (target1M !== null && q.close) ? ((target1M - q.close) / q.close) * 100 : null;
+
+                    if (!isFinite(ret1D)) ret1D = null;
+                    if (!isFinite(ret1W)) ret1W = null;
+                    if (!isFinite(ret2W)) ret2W = null;
+                    if (!isFinite(ret1M)) ret1M = null;
+
+                    if (ret1D === null && ret1W === null && ret2W === null && ret1M === null) {
+                        continue;
+                    }
 
                     // --- Features ---
                     const currentPrice = q.close;
@@ -283,9 +294,6 @@ router.post('/run', async (req, res) => {
 
                     const quantScore = QuantScorer.calculateScore(stockObj, vixItem, spyChg);
 
-                    const r1w = isFinite(ret1W) ? ret1W : 0;
-                    const r2w = isFinite(ret2W) ? ret2W : 0;
-                    const r1m = isFinite(ret1M) ? ret1M : 0;
                     const rsVal = isFinite(rsRating) ? rsRating : 1.0;
 
                     allResults.push({
@@ -298,9 +306,10 @@ router.post('/run', async (req, res) => {
                         rVol: Number(rVol.toFixed(2)),
                         priceChangeOverAdr: Number(priceChangeOverAdr.toFixed(2)),
                         episodicPivotPower: Number(episodicPivotPower.toFixed(2)),
-                        ret1W: Number(r1w.toFixed(2)),
-                        ret2W: Number(r2w.toFixed(2)),
-                        ret1M: Number(r1m.toFixed(2)),
+                        ret1D: ret1D !== null ? Number(ret1D.toFixed(2)) : null,
+                        ret1W: ret1W !== null ? Number(ret1W.toFixed(2)) : null,
+                        ret2W: ret2W !== null ? Number(ret2W.toFixed(2)) : null,
+                        ret1M: ret1M !== null ? Number(ret1M.toFixed(2)) : null,
                         ema10DistAtr: Number(dist10.toFixed(2)),
                         ema20DistAtr: Number(dist20.toFixed(2))
                     });

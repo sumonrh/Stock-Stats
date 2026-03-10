@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ZAxis } from 'recharts';
+import React, { useState, useMemo } from 'react';
+import { ScatterChart, Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ZAxis, Label } from 'recharts';
 import QuantModelTrainer from './QuantModelTrainer';
+import { findBestFitRegression } from '../utils/mathUtils';
 
 const BINS = [
     { label: '< 20', min: 0, max: 20 },
@@ -13,19 +14,14 @@ const BINS = [
 export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
     const [backtestData, setBacktestData] = useState([]);
     const [loading, setLoading] = useState(false);
-
-    // Data Loader State
     const [loaderInput, setLoaderInput] = useState('');
     const [loadedTickers, setLoadedTickers] = useState([]);
     const [isLoaderLoading, setIsLoaderLoading] = useState(false);
-
-    const [xAxisMetric, setXAxisMetric] = useState('quantScore');
-    const [yAxisMetric, setYAxisMetric] = useState('ret1W');
+    const [xAxisMetric, setXAxisMetric] = useState('rVol');
+    const [yAxisMetric, setYAxisMetric] = useState('ret1D');
     const [colorMetric, setColorMetric] = useState('vcp');
     const [isCacheLoading, setIsCacheLoading] = useState(false);
-    const [aiFormula, setAiFormula] = useState(null); // { weights, stats }
-
-
+    const [aiFormula, setAiFormula] = useState(null);
 
     const runBacktest = async () => {
         setLoading(true);
@@ -49,11 +45,12 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
         setLoading(false);
     };
 
-    const scatterData = useMemo(() => {
-        return backtestData.map(d => {
+    const { scatterData, regression } = useMemo(() => {
+        const filteredData = backtestData.filter(d => d[yAxisMetric] !== null && d[xAxisMetric] !== null);
+
+        const data = filteredData.map(d => {
             let xVal = d[xAxisMetric];
             if (xAxisMetric === 'aiScore' && aiFormula) {
-                // Calculate AI Score on the fly using normalized weights
                 const normalize = (val, mean, std) => {
                     const s = std || 1;
                     const z = (val - mean) / s;
@@ -69,13 +66,9 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                 bounded = Math.max(0, Math.min(100, bounded));
                 xVal = Number(bounded.toFixed(2));
             }
-
-            // Fallback for missing or non-numeric values to prevent empty charts
             if (typeof xVal !== 'number' || isNaN(xVal)) {
-                // If it's RS, default to a neutral 1.0, otherwise 0
                 xVal = xAxisMetric === 'rs' ? 1.0 : 0;
             }
-
             return {
                 x: xVal,
                 y: d[yAxisMetric],
@@ -84,6 +77,30 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                 date: d.date
             };
         });
+
+        if (data.length < 2) return { scatterData: data, regression: null };
+
+        const points = data.map(d => ({ x: d.x, y: d.y }));
+        const reg = findBestFitRegression(points, 4, 1, false);
+
+        // Add regression line data
+        const xMin = Math.min(...points.map(p => p.x));
+        const xMax = Math.max(...points.map(p => p.x));
+        const lineData = [
+            { x: xMin, y: reg.predict(xMin) },
+            { x: xMax, y: reg.predict(xMax) }
+        ];
+
+        reg.lineData = lineData;
+
+        // Calculate MAE
+        let sumAbsErr = 0;
+        points.forEach(p => {
+            sumAbsErr += Math.abs(p.y - reg.predict(p.x));
+        });
+        reg.mae = sumAbsErr / points.length;
+
+        return { scatterData: data, regression: reg };
     }, [backtestData, xAxisMetric, yAxisMetric, colorMetric, aiFormula]);
 
     const handleLoadTickers = async (e) => {
@@ -122,11 +139,8 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
             const res = await fetch('/api/data-loader/cache');
             const cachedTickers = await res.json();
             if (cachedTickers.length > 0) {
-                // Pre-fill the input box with all cached names, then auto-fire load
                 const tickerString = cachedTickers.join(',');
                 setLoaderInput(tickerString);
-                // Option A: Just fill the form
-                // Option B: Auto trigger the load method immediately:
                 const loadRes = await fetch('/api/data-loader/load', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -160,8 +174,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
     return (
         <div className="p-4 bg-gray-900 min-h-screen text-white">
             <h2 className="text-2xl font-bold mb-4 text-emerald-400">Quant Score Parameters Backtest</h2>
-
-            {/* Ticker Data Loader Section */}
             <div className="bg-gray-800 p-4 rounded-lg shadow-lg mb-6">
                 <div className="flex justify-between items-center mb-4">
                     <h3 className="text-xl font-semibold flex items-center gap-2">
@@ -169,7 +181,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                         <span className="text-sm bg-gray-700 text-gray-300 px-2 py-1 rounded-full">{loadedTickers.length} tickers</span>
                     </h3>
                 </div>
-
                 <form onSubmit={handleLoadTickers} className="flex gap-2 mb-4">
                     <div className="flex-1 bg-gray-700 rounded-md border border-gray-600 focus-within:border-blue-500 overflow-hidden">
                         <input
@@ -189,7 +200,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                         </button>
                     </div>
                 </form>
-
                 {loadedTickers.length > 0 && (
                     <div className="overflow-x-auto w-full">
                         <table className="w-full text-sm text-center">
@@ -243,7 +253,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
             </div>
 
             <div className="flex flex-col md:flex-row gap-6">
-                {/* Left Panel: Controls */}
                 <div className="w-full md:w-1/3 bg-gray-800 p-4 rounded-lg shadow-lg">
                     <button
                         onClick={runBacktest}
@@ -252,7 +261,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                     >
                         {loading ? 'Crunching 4 Years of Data...' : 'Run Historical Backtest on Watchlist'}
                     </button>
-
                     <h3 className="text-xl font-semibold mb-2 mt-6">Chart Controls</h3>
                     <div className="space-y-3">
                         <div>
@@ -273,6 +281,7 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                         <div>
                             <label className="block text-sm text-gray-400 mb-1">Y-Axis (Future Return)</label>
                             <select value={yAxisMetric} onChange={e => setYAxisMetric(e.target.value)} className="w-full bg-gray-700 rounded px-2 py-1.5 border border-gray-600">
+                                <option value="ret1D">1 Day Forward Return (%)</option>
                                 <option value="ret1W">1 Week Forward Return (%)</option>
                                 <option value="ret2W">2 Week Forward Return (%)</option>
                                 <option value="ret1M">1 Month Forward Return (%)</option>
@@ -281,7 +290,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                     </div>
                 </div>
 
-                {/* Right Panel: Charts */}
                 <div className="w-full md:w-2/3 bg-gray-800 p-4 rounded-lg shadow-lg flex flex-col items-center justify-center min-h-[500px]">
                     {backtestData.length === 0 ? (
                         <div className="text-gray-400 text-center">
@@ -290,12 +298,28 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                         </div>
                     ) : (
                         <div className="w-full h-full min-h-[500px]">
-                            <h3 className="text-center font-bold text-lg mb-2">{xAxisMetric} vs {yAxisMetric}</h3>
+                            <div className="flex justify-between items-center mb-2 px-8">
+                                <h3 className="text-center font-bold text-lg text-white">{xAxisMetric} vs {yAxisMetric}</h3>
+                                {regression && (
+                                    <div className="text-xs text-gray-300 bg-gray-700/50 px-3 py-1 rounded-md">
+                                        <span className="font-bold text-emerald-400">{regression.type} Fit:</span>
+                                        <span className="font-mono ml-2">{regression.equation}</span>
+                                        <span className="mx-3 text-gray-500">|</span>
+                                        <span className="font-semibold">R²:</span> <span className="font-mono text-white">{regression.r2.toFixed(3)}</span>
+                                        <span className="mx-3 text-gray-500">|</span>
+                                        <span className="font-semibold">MAE:</span> <span className="font-mono text-white">{regression.mae.toFixed(2)}%</span>
+                                    </div>
+                                )}
+                            </div>
                             <ResponsiveContainer width="100%" height="90%">
-                                <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
+                                <ScatterChart margin={{ top: 20, right: 30, bottom: 30, left: 30 }}>
                                     <CartesianGrid strokeDasharray="3 3" stroke="#4a5568" />
-                                    <XAxis type="number" dataKey="x" name={xAxisMetric} stroke="#a0aec0" domain={['auto', 'auto']} />
-                                    <YAxis type="number" dataKey="y" name={yAxisMetric} stroke="#a0aec0" domain={['auto', 'auto']} />
+                                    <XAxis type="number" dataKey="x" name={xAxisMetric} stroke="#a0aec0" domain={['auto', 'auto']}>
+                                        <Label value={xAxisMetric} offset={-20} position="insideBottom" style={{ fill: '#a0aec0' }} />
+                                    </XAxis>
+                                    <YAxis type="number" dataKey="y" name={yAxisMetric} unit="%" stroke="#a0aec0" domain={['auto', 'auto']}>
+                                        <Label value={yAxisMetric} angle={-90} position="insideLeft" style={{ fill: '#a0aec0' }} />
+                                    </YAxis>
                                     <ZAxis type="number" dataKey="z" range={[20, 100]} />
                                     <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} content={({ active, payload }) => {
                                         if (active && payload && payload.length) {
@@ -303,8 +327,8 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                             return (
                                                 <div className="bg-gray-700 p-3 rounded shadow-lg border border-gray-600">
                                                     <p className="font-bold text-white">{data.ticker} ({data.date})</p>
-                                                    <p className="text-emerald-400">{xAxisMetric}: {data.x}</p>
-                                                    <p className="text-blue-400">{yAxisMetric}: {data.y}%</p>
+                                                    <p className="text-emerald-400">{xAxisMetric}: {data.x.toFixed(2)}</p>
+                                                    <p className="text-blue-400">{yAxisMetric}: {data.y.toFixed(2)}%</p>
                                                     <p className="text-yellow-400">{colorMetric}: {data.z}</p>
                                                 </div>
                                             );
@@ -312,6 +336,9 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                         return null;
                                     }} />
                                     <Scatter name="Backtest Data" data={scatterData} fill="#10b981" fillOpacity={0.6} />
+                                    {regression && regression.lineData && (
+                                        <Line type="monotone" dataKey="y" data={regression.lineData} stroke="#f59e0b" strokeWidth={2} dot={false} activeDot={false} name="Regression" />
+                                    )}
                                 </ScatterChart>
                             </ResponsiveContainer>
                         </div>
@@ -319,7 +346,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                 </div>
             </div>
 
-            {/* Neural Network Model Trainer */}
             {backtestData.length > 0 && (
                 <QuantModelTrainer
                     backtestData={backtestData}
@@ -330,7 +356,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                 />
             )}
 
-            {/* Bottom Panel: Data Table */}
             {backtestData.length > 0 && (
                 <div className="mt-6 bg-gray-800 p-4 rounded-lg shadow-lg overflow-x-auto">
                     <h3 className="text-xl font-semibold mb-4">Historical Parameter Data ({backtestData.length} records)</h3>
@@ -344,12 +369,13 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                     {aiFormula && <th className="px-4 py-3 text-emerald-400">AI Score</th>}
                                     <th className="px-4 py-3">RS Delta</th>
                                     <th className="px-4 py-3 font-semibold text-emerald-400">RS</th>
-                                    <th className="px-4 py-3">VCP</th>
+                                    <th className="px_4 py-3">VCP</th>
                                     <th className="px-4 py-3">RVol</th>
                                     <th className="px-4 py-3">Move/ADR</th>
                                     <th className="px-4 py-3">EP Power</th>
                                     <th className="px-4 py-3">Dist 10EMA</th>
                                     <th className="px-4 py-3">Dist 20EMA</th>
+                                    <th className="px-4 py-3 text-right">1D Ret</th>
                                     <th className="px-4 py-3 text-right">1W Ret</th>
                                     <th className="px-4 py-3 text-right">2W Ret</th>
                                     <th className="px-4 py-3 text-right">1M Ret</th>
@@ -375,7 +401,6 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                                         const z = normalize(featVal, aiFormula.stats[w.feature]?.mean || 0, aiFormula.stats[w.feature]?.std || 1);
                                                         score += (w.weight * z);
                                                     });
-                                                    // Map bounded Z-score dynamically to a 0-100 continuum
                                                     let bounded = 50 + (score / 4);
                                                     bounded = Math.max(0, Math.min(100, bounded));
                                                     return bounded.toFixed(1);
@@ -390,9 +415,10 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                         <td className="px-4 py-2 font-semibold text-purple-400">{row.episodicPivotPower}</td>
                                         <td className="px-4 py-2">{row.ema10DistAtr}</td>
                                         <td className="px-4 py-2">{row.ema20DistAtr}</td>
-                                        <td className={`px-4 py-2 text-right ${row.ret1W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1W}%</td>
-                                        <td className={`px-4 py-2 text-right ${row.ret2W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret2W}%</td>
-                                        <td className={`px-4 py-2 text-right ${row.ret1M >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1M}%</td>
+                                        <td className={`px-4 py-2 text-right ${row.ret1D >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1D !== null ? `${row.ret1D}%` : 'N/A'}</td>
+                                        <td className={`px-4 py-2 text-right ${row.ret1W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1W !== null ? `${row.ret1W}%` : 'N/A'}</td>
+                                        <td className={`px-4 py-2 text-right ${row.ret2W >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret2W !== null ? `${row.ret2W}%` : 'N/A'}</td>
+                                        <td className={`px-4 py-2 text-right ${row.ret1M >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.ret1M !== null ? `${row.ret1M}%` : 'N/A'}</td>
                                     </tr>
                                 ))}
                             </tbody>

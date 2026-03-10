@@ -3,7 +3,7 @@ import { trainQuantModel, predictFutureReturn } from '../utils/quantLstmModel';
 
 export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
     const [training, setTraining] = useState(false);
-    const [targetFeature, setTargetFeature] = useState('ret1W');
+    const [targetFeature, setTargetFeature] = useState('ret1D');
     const [epochs, setEpochs] = useState(50);
     const [sequenceLength, setSequenceLength] = useState(5);
     const [currentEpoch, setCurrentEpoch] = useState(0);
@@ -108,6 +108,7 @@ export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
                                 className="w-full bg-gray-700 rounded px-2 py-2 border border-gray-600 focus:outline-none focus:border-emerald-500"
                                 disabled={training}
                             >
+                                <option value="ret1D">1-Day Forward Return (%)</option>
                                 <option value="ret1W">1-Week Forward Return (%)</option>
                                 <option value="ret2W">2-Week Forward Return (%)</option>
                                 <option value="ret1M">1-Month Forward Return (%)</option>
@@ -202,7 +203,11 @@ export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
                 <div className="w-full md:w-1/2 space-y-4">
                     <h4 className="font-semibold text-lg border-b border-gray-700 pb-2">Manual Inference</h4>
                     <p className="text-sm text-gray-400">
-                        Enter current parameter values to predict the {targetFeature === 'ret1W' ? '1-Week' : targetFeature === 'ret2W' ? '2-Week' : '1-Month'} forward percentage return using the trained logic.
+                        Enter current parameter values to predict the {
+                            targetFeature === 'ret1D' ? '1-Day' :
+                            targetFeature === 'ret1W' ? '1-Week' :
+                            targetFeature === 'ret2W' ? '2-Week' : '1-Month'
+                        } forward percentage return using the trained logic.
                     </p>
 
                     <div className="grid grid-cols-2 gap-x-4 gap-y-3">
