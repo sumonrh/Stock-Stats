@@ -212,8 +212,18 @@ const calcPolynomial = (data, order) => {
         matrix.push(row);
     }
 
+    // Add small ridge penalty to diagonal for stability
+    for (let i = 0; i <= order; i++) {
+        matrix[i][i] += 1e-6;
+    }
+
     let coeffs = gaussianElimination(matrix, sumXY);
-    if (!coeffs) return { r2: -1 }; // Singular
+    if (!coeffs) return {
+        type: 'None',
+        equation: 'Unable to fit model',
+        r2: 0,
+        predict: () => 0
+    };
 
     const actualY = data.map(d => d.y);
     const predictedY = data.map(d => {
@@ -231,7 +241,7 @@ const calcPolynomial = (data, order) => {
     let eqParts = [];
     for (let i = order; i >= 0; i--) {
         let c = coeffs[i];
-        if (Math.abs(c) < 1e-10) continue;
+        if (Math.abs(c) < 1e-15) continue;
 
         let termStr = "";
         let absC = Math.abs(c);
@@ -264,6 +274,7 @@ const calcPolynomial = (data, order) => {
         equation,
         r2,
         predict: (x) => {
+            if (!coeffs) return 0;
             let y = 0;
             let xPower = 1;
             for (let i = 0; i <= order; i++) {
@@ -290,20 +301,22 @@ export const findBestFitRegression = (points, maxPolyOrder = 2, minPolyOrder = 1
     let best = null;
 
     if (includeExponential) {
-        best = calcExponential(data);
+        const exp = calcExponential(data);
+        if (exp && exp.r2 >= 0) best = exp;
     }
 
     // Test polynomial models from minPolyOrder up to maxPolyOrder
     for (let order = minPolyOrder; order <= maxPolyOrder; order++) {
-        // Or if order is 1 we can just use calcPolynomial(data, 1) and that acts as linear
         const poly = calcPolynomial(data, order);
-        if (!best || (poly && poly.r2 > best.r2)) {
-            best = poly;
+        if (poly && poly.r2 !== undefined && poly.r2 !== -1) {
+            if (!best || poly.r2 > best.r2) {
+                best = poly;
+            }
         }
     }
 
-    // Default to a model even if r2 is negative (e.g. completely linear flat)
-    if (!best || best.r2 === -1) {
+    // Default to a model even if r2 is negative or 0
+    if (!best) {
         return calcPolynomial(data, minPolyOrder);
     }
 

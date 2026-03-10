@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { ScatterChart, Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ZAxis, Label } from 'recharts';
+import { ScatterChart, ComposedChart, Scatter, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ZAxis, Label } from 'recharts';
 import QuantModelTrainer from './QuantModelTrainer';
 import { findBestFitRegression } from '../utils/mathUtils';
 
@@ -78,27 +78,29 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
             };
         });
 
-        if (data.length < 2) return { scatterData: data, regression: null };
+        if (data.length < 3) return { scatterData: data, regression: null };
 
         const points = data.map(d => ({ x: d.x, y: d.y }));
         const reg = findBestFitRegression(points, 4, 1, false);
 
-        // Add regression line data
-        const xMin = Math.min(...points.map(p => p.x));
-        const xMax = Math.max(...points.map(p => p.x));
-        const lineData = [
-            { x: xMin, y: reg.predict(xMin) },
-            { x: xMax, y: reg.predict(xMax) }
-        ];
+        if (reg) {
+            // Add regression line data
+            const xMin = Math.min(...points.map(p => p.x));
+            const xMax = Math.max(...points.map(p => p.x));
+            const lineData = [
+                { x: xMin, y: reg.predict(xMin) },
+                { x: xMax, y: reg.predict(xMax) }
+            ];
 
-        reg.lineData = lineData;
+            reg.lineData = lineData;
 
-        // Calculate MAE
-        let sumAbsErr = 0;
-        points.forEach(p => {
-            sumAbsErr += Math.abs(p.y - reg.predict(p.x));
-        });
-        reg.mae = sumAbsErr / points.length;
+            // Calculate MAE
+            let sumAbsErr = 0;
+            points.forEach(p => {
+                sumAbsErr += Math.abs(p.y - reg.predict(p.x));
+            });
+            reg.mae = sumAbsErr / points.length;
+        }
 
         return { scatterData: data, regression: reg };
     }, [backtestData, xAxisMetric, yAxisMetric, colorMetric, aiFormula]);
@@ -116,15 +118,19 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                 body: JSON.stringify({ tickers })
             });
             const data = await res.json();
-            if (res.ok) {
+            if (res.ok && Array.isArray(data)) {
                 setLoadedTickers(prev => {
                     const existingMap = new Map(prev.map(item => [item.ticker, item]));
-                    data.forEach(item => existingMap.set(item.ticker, item));
+                    data.forEach(item => {
+                        if (item && item.ticker) {
+                            existingMap.set(item.ticker, item);
+                        }
+                    });
                     return Array.from(existingMap.values());
                 });
                 setLoaderInput('');
             } else {
-                alert("Error: " + data.error);
+                alert("Error: " + (data.error || "Failed to parse ticker data"));
             }
         } catch (e) {
             console.error(e);
@@ -138,27 +144,31 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
         try {
             const res = await fetch('/api/data-loader/cache');
             const cachedTickers = await res.json();
-            if (cachedTickers.length > 0) {
-                const tickerString = cachedTickers.join(',');
-                setLoaderInput(tickerString);
+            if (Array.isArray(cachedTickers) && cachedTickers.length > 0) {
                 const loadRes = await fetch('/api/data-loader/load', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ tickers: cachedTickers })
                 });
                 const data = await loadRes.json();
-                if (loadRes.ok) {
+                if (loadRes.ok && Array.isArray(data)) {
                     setLoadedTickers(prev => {
                         const existingMap = new Map(prev.map(item => [item.ticker, item]));
-                        data.forEach(item => existingMap.set(item.ticker, item));
+                        data.forEach(item => {
+                            if (item && item.ticker) {
+                                existingMap.set(item.ticker, item);
+                            }
+                        });
                         return Array.from(existingMap.values());
                     });
                     setLoaderInput('');
                 } else {
-                    alert("Error loading cache: " + data.error);
+                    alert("Error loading cache: " + (data.error || "Invalid response"));
                 }
-            } else {
+            } else if (Array.isArray(cachedTickers)) {
                 alert("No cached CSV files found in 'Quant backtest stock data'.");
+            } else {
+                alert("Error reading cache list from server.");
             }
         } catch (e) {
             console.error(e);
@@ -223,29 +233,35 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-gray-800">
-                                {loadedTickers.sort((a, b) => b.score - a.score).map((row) => (
-                                    <tr key={row.ticker} className="hover:bg-gray-700 bg-gray-800 transition-colors group">
-                                        <td className="px-3 py-2 font-bold text-left text-white">{row.ticker}</td>
-                                        <td className="px-3 py-2 text-emerald-400 font-bold bg-green-900/20">{row.score}</td>
-                                        <td className="px-3 py-2 text-gray-200">{row.price}</td>
-                                        <td className={`px-3 py-2 font-medium ${parseFloat(row.percentChange) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.percentChange}%</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.rVol) > 1.5 ? 'text-green-400 font-bold' : 'text-red-400'}`}>{row.rVol}</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.rs) > 1 ? 'text-green-400 font-bold' : 'text-gray-400'}`}>{row.rs}</td>
-                                        <td className="px-3 py-2 text-green-400">{row.rsDelta}%</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.e10) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e10}</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.e20) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e20}</td>
-                                        <td className={`px-3 py-2 ${parseFloat(row.e50) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{row.e50}</td>
-                                        <td className="px-3 py-2 text-gray-300">{row.projVol}M</td>
-                                        <td className="px-3 py-2 text-gray-300">${row.vwap}</td>
-                                        <td className="px-3 py-2 text-yellow-400 font-medium">{row.vcp}</td>
-                                        <td className="px-3 py-2 text-gray-400 text-xs whitespace-nowrap">+{row.newRowsAppended} rows</td>
-                                        <td className="px-3 py-2">
-                                            <button onClick={() => removeLoadedTicker(row.ticker)} className="text-gray-500 hover:text-white bg-gray-700 hover:bg-gray-600 rounded px-2 py-1 transition-colors">
-                                                ✕
-                                            </button>
-                                        </td>
-                                    </tr>
-                                ))}
+                                {Array.isArray(loadedTickers) && [...loadedTickers]
+                                    .sort((a, b) => {
+                                        const scoreA = (a && typeof a.score === 'number' && !isNaN(a.score)) ? a.score : -1;
+                                        const scoreB = (b && typeof b.score === 'number' && !isNaN(b.score)) ? b.score : -1;
+                                        return scoreB - scoreA;
+                                    })
+                                    .map((row) => (
+                                        <tr key={row.ticker || Math.random()} className="hover:bg-gray-700 bg-gray-800 transition-colors group">
+                                            <td className="px-3 py-2 font-bold text-left text-white">{row.ticker || 'N/A'}</td>
+                                            <td className="px-3 py-2 text-emerald-400 font-bold bg-green-900/20">{row.score ?? 'N/A'}</td>
+                                            <td className="px-3 py-2 text-gray-200">{row.price ?? 'N/A'}</td>
+                                            <td className={`px-3 py-2 font-medium ${(row.percentChange && parseFloat(row.percentChange) >= 0) ? 'text-green-400' : 'text-red-400'}`}>{row.percentChange ?? '0.00'}%</td>
+                                            <td className={`px-3 py-2 ${(row.rVol && parseFloat(row.rVol) > 1.5) ? 'text-green-400 font-bold' : 'text-red-400'}`}>{row.rVol ?? '1.00'}</td>
+                                            <td className={`px-3 py-2 ${(row.rs && parseFloat(row.rs) > 1) ? 'text-green-400 font-bold' : 'text-gray-400'}`}>{row.rs ?? '1.00'}</td>
+                                            <td className="px-3 py-2 text-green-400">{row.rsDelta ?? '0.00'}%</td>
+                                            <td className={`px-3 py-2 ${(row.e10 && parseFloat(row.e10) >= 0) ? 'text-green-400' : 'text-red-400'}`}>{row.e10 ?? '0.00'}</td>
+                                            <td className={`px-3 py-2 ${(row.e20 && parseFloat(row.e20) >= 0) ? 'text-green-400' : 'text-red-400'}`}>{row.e20 ?? '0.00'}</td>
+                                            <td className={`px-3 py-2 ${(row.e50 && parseFloat(row.e50) >= 0) ? 'text-green-400' : 'text-red-400'}`}>{row.e50 ?? '0.00'}</td>
+                                            <td className="px-3 py-2 text-gray-300">{row.projVol ?? '0.00'}M</td>
+                                            <td className="px-3 py-2 text-gray-300">${row.vwap ?? '0.00'}</td>
+                                            <td className="px-3 py-2 text-yellow-400 font-medium">{row.vcp ?? 'No'}</td>
+                                            <td className="px-3 py-2 text-gray-400 text-xs whitespace-nowrap">+{row.newRowsAppended ?? 0} rows</td>
+                                            <td className="px-3 py-2">
+                                                <button onClick={() => removeLoadedTicker(row.ticker)} className="text-gray-500 hover:text-white bg-gray-700 hover:bg-gray-600 rounded px-2 py-1 transition-colors" title="Remove ticker">
+                                                    ✕
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
                             </tbody>
                         </table>
                     </div>
@@ -305,14 +321,14 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                         <span className="font-bold text-emerald-400">{regression.type} Fit:</span>
                                         <span className="font-mono ml-2">{regression.equation}</span>
                                         <span className="mx-3 text-gray-500">|</span>
-                                        <span className="font-semibold">R²:</span> <span className="font-mono text-white">{regression.r2.toFixed(3)}</span>
+                                        <span className="font-semibold">R²:</span> <span className="font-mono text-white">{typeof regression.r2 === 'number' ? regression.r2.toFixed(3) : '0.000'}</span>
                                         <span className="mx-3 text-gray-500">|</span>
-                                        <span className="font-semibold">MAE:</span> <span className="font-mono text-white">{regression.mae.toFixed(2)}%</span>
+                                        <span className="font-semibold">MAE:</span> <span className="font-mono text-white">{typeof regression.mae === 'number' ? regression.mae.toFixed(2) : '0.00'}%</span>
                                     </div>
                                 )}
                             </div>
                             <ResponsiveContainer width="100%" height="90%">
-                                <ScatterChart margin={{ top: 20, right: 30, bottom: 30, left: 30 }}>
+                                <ComposedChart margin={{ top: 20, right: 30, bottom: 30, left: 30 }}>
                                     <CartesianGrid strokeDasharray="3 3" stroke="#4a5568" />
                                     <XAxis type="number" dataKey="x" name={xAxisMetric} stroke="#a0aec0" domain={['auto', 'auto']}>
                                         <Label value={xAxisMetric} offset={-20} position="insideBottom" style={{ fill: '#a0aec0' }} />
@@ -323,23 +339,24 @@ export default function QuantBacktestTab({ availableTickers, rawMarketData }) {
                                     <ZAxis type="number" dataKey="z" range={[20, 100]} />
                                     <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} content={({ active, payload }) => {
                                         if (active && payload && payload.length) {
-                                            const data = payload[0].payload;
+                                            const item = payload[0].payload;
+                                            if (!item) return null;
                                             return (
-                                                <div className="bg-gray-700 p-3 rounded shadow-lg border border-gray-600">
-                                                    <p className="font-bold text-white">{data.ticker} ({data.date})</p>
-                                                    <p className="text-emerald-400">{xAxisMetric}: {data.x.toFixed(2)}</p>
-                                                    <p className="text-blue-400">{yAxisMetric}: {data.y.toFixed(2)}%</p>
-                                                    <p className="text-yellow-400">{colorMetric}: {data.z}</p>
+                                                <div className="bg-gray-700 p-3 rounded shadow-lg border border-gray-600 text-sm">
+                                                    <p className="font-bold text-white border-b border-gray-600 mb-1 pb-1">{item.ticker || 'N/A'} ({item.date || 'N/A'})</p>
+                                                    <p className="text-emerald-400 font-medium">{xAxisMetric}: {typeof item.x === 'number' ? item.x.toFixed(2) : item.x}</p>
+                                                    <p className="text-blue-400 font-medium">{yAxisMetric}: {typeof item.y === 'number' ? item.y.toFixed(2) : item.y}%</p>
+                                                    <p className="text-yellow-400">{colorMetric}: {item.z}</p>
                                                 </div>
                                             );
                                         }
                                         return null;
                                     }} />
-                                    <Scatter name="Backtest Data" data={scatterData} fill="#10b981" fillOpacity={0.6} />
-                                    {regression && regression.lineData && (
-                                        <Line type="monotone" dataKey="y" data={regression.lineData} stroke="#f59e0b" strokeWidth={2} dot={false} activeDot={false} name="Regression" />
+                                    <Scatter name="Backtest Data" data={scatterData || []} fill="#10b981" fillOpacity={0.6} />
+                                    {regression && regression.lineData && Array.isArray(regression.lineData) && (
+                                        <Line type="monotone" dataKey="y" data={regression.lineData} stroke="#f59e0b" strokeWidth={3} dot={false} activeDot={false} name="Regression" />
                                     )}
-                                </ScatterChart>
+                                </ComposedChart>
                             </ResponsiveContainer>
                         </div>
                     )}
