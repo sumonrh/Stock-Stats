@@ -131,10 +131,10 @@ export const buildQuantLstmModel = (sequenceLength, numFeatures) => {
     model.add(tf.layers.dense({ units: 16, activation: 'elu', kernelInitializer: 'heNormal' }));
     model.add(tf.layers.dense({ units: 1 })); // Linear output
 
-    // Compile with Huber Loss (Standard for financial data: robust to outliers)
+    // Compile with Mean Absolute Error (Robust to financial outliers like Huber, but standard identifier)
     model.compile({
         optimizer: tf.train.adam(0.0007), // Slightly lower LR for stability
-        loss: 'huberLoss' // Swap MSE for HuberLoss
+        loss: 'meanAbsoluteError'
     });
 
     return model;
