@@ -3,9 +3,9 @@ import { trainQuantModel, predictFutureReturn } from '../utils/quantLstmModel';
 
 export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
     const [training, setTraining] = useState(false);
-    const [targetFeature, setTargetFeature] = useState('ret1D');
-    const [epochs, setEpochs] = useState(50);
-    const [sequenceLength, setSequenceLength] = useState(5);
+    const [targetFeature, setTargetFeature] = useState('ret1W');
+    const [epochs, setEpochs] = useState(100);
+    const [sequenceLength, setSequenceLength] = useState(10);
     const [currentEpoch, setCurrentEpoch] = useState(0);
     const [loss, setLoss] = useState(null);
 
@@ -133,6 +133,7 @@ export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
                                 className="w-full bg-gray-700 rounded px-2 py-2 border border-gray-600"
                                 disabled={training}
                             />
+                            <p className="text-[10px] text-gray-500 mt-1">💡 Use 10-20 sessions for weekly predictions.</p>
                         </div>
                     </div>
 
@@ -141,7 +142,7 @@ export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
                         disabled={training || !backtestData || backtestData.length === 0}
                         className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 px-4 py-3 rounded text-white font-bold shadow-md transition-colors mt-4"
                     >
-                        {training ? `Training... Epoch ${currentEpoch}/${epochs}` : 'Build & Train LSTM Model'}
+                        {training ? `🚀 Initializing GPU/CPU... Epoch ${currentEpoch}/${epochs}` : 'Build & Train LSTM Model'}
                     </button>
 
                     {loss && (
@@ -205,8 +206,8 @@ export default function QuantModelTrainer({ backtestData, onApplyAiFormula }) {
                     <p className="text-sm text-gray-400">
                         Enter current parameter values to predict the {
                             targetFeature === 'ret1D' ? '1-Day' :
-                            targetFeature === 'ret1W' ? '1-Week' :
-                            targetFeature === 'ret2W' ? '2-Week' : '1-Month'
+                                targetFeature === 'ret1W' ? '1-Week' :
+                                    targetFeature === 'ret2W' ? '2-Week' : '1-Month'
                         } forward percentage return using the trained logic.
                     </p>
 

@@ -107,23 +107,34 @@ export const prepareQuantDataForLstm = (backtestData, targetFeature = 'ret1W', s
 export const buildQuantLstmModel = (sequenceLength, numFeatures) => {
     const model = tf.sequential();
 
-    // 1st LSTM Layer (Single layer is preferred in browser to prevent thread freezing)
+    // 1st LSTM Layer 
     model.add(tf.layers.lstm({
         units: 64,
         inputShape: [sequenceLength, numFeatures],
-        returnSequences: false
+        returnSequences: true, // Allow stacking a 2nd LSTM layer
+        kernelInitializer: 'glorotUniform'
     }));
+    model.add(tf.layers.batchNormalization());
     model.add(tf.layers.dropout({ rate: 0.2 }));
 
-    // Dense Layers
-    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+    // 2nd LSTM Layer
+    model.add(tf.layers.lstm({
+        units: 32,
+        returnSequences: false,
+        kernelInitializer: 'glorotUniform'
+    }));
+    model.add(tf.layers.batchNormalization());
     model.add(tf.layers.dropout({ rate: 0.1 }));
+
+    // Dense layers for feature combinations
+    model.add(tf.layers.dense({ units: 32, activation: 'elu', kernelInitializer: 'heNormal' }));
+    model.add(tf.layers.dense({ units: 16, activation: 'elu', kernelInitializer: 'heNormal' }));
     model.add(tf.layers.dense({ units: 1 })); // Linear output
 
-    // Compile with Mean Squared Error
+    // Compile with Huber Loss (Standard for financial data: robust to outliers)
     model.compile({
-        optimizer: tf.train.adam(0.001),
-        loss: 'meanSquaredError'
+        optimizer: tf.train.adam(0.0007), // Slightly lower LR for stability
+        loss: 'huberLoss' // Swap MSE for HuberLoss
     });
 
     return model;
