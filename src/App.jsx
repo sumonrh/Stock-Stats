@@ -6,6 +6,7 @@ import { runTfjsPipeline, loadModelFromStorage, loadModelFromFiles, downloadMode
 import { findBestFitRegression, getExpectedCumulativeVolumePercentage } from './utils/mathUtils';
 import MarketRegime from './MarketRegime';
 import QuantBacktestTab from './components/QuantBacktestTab';
+import BacktestSimulationTab from './components/BacktestSimulationTab';
 
 // --- CONFIGURATION ---
 const INITIAL_TICKERS = ['VICR', 'RKLB', 'PL', 'ASTS', 'SEDG', 'MU', 'IREN', 'BE', 'LITE', 'OKLO', 'QBTS', 'WDC', 'EOSE', 'INTC', 'COHR', 'FIX', 'AU', 'VSCO', 'WPM'];
@@ -182,7 +183,7 @@ export default function App() {
   const [manualAiResult, setManualAiResult] = useState(null);
 
   // --- INTRADAY NEW STATE ---
-  const [activeTab, setActiveTab] = useState('daily'); // 'daily' | 'intraday' | 'quantBacktest'
+  const [activeTab, setActiveTab] = useState('daily'); // 'daily' | 'intraday' | 'quantBacktest' | 'backtest'
   const [intradayFiles, setIntradayFiles] = useState([]);
   const [intradayData, setIntradayData] = useState({}); // { ticker: data }
   const [selectedIntradayTicker, setSelectedIntradayTicker] = useState('ALL');
@@ -1648,6 +1649,12 @@ export default function App() {
               Quant Backtester
             </button>
             <button
+              onClick={() => setActiveTab('backtest')}
+              className={`px-4 py-2 font-semibold text-sm ${activeTab === 'backtest' ? 'border-b-2 border-orange-600 text-orange-600' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Day Trade Simulation
+            </button>
+            <button
               onClick={() => setActiveTab('regime')}
               className={`px-4 py-2 font-semibold text-sm ${activeTab === 'regime' ? 'border-b-2 border-orange-600 text-orange-600' : 'text-slate-500 hover:text-slate-700'}`}
             >
@@ -1658,6 +1665,10 @@ export default function App() {
 
         {activeTab === 'quantBacktest' && (
           <QuantBacktestTab availableTickers={availableTickers} rawMarketData={rawMarketData} />
+        )}
+
+        {activeTab === 'backtest' && (
+          <BacktestSimulationTab />
         )}
 
         {/* Existing Content wrapped in activeTab === 'daily' */}

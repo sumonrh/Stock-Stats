@@ -1,11 +1,15 @@
 import express from 'express';
 import cors from 'cors';
+import dotenv from 'dotenv';
+dotenv.config();
+
 import yahooFinance from 'yahoo-finance2';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import quantBacktestRouter from './routes/quantBacktest.js';
 import dataLoaderRouter from './routes/dataLoader.js';
+import backtestSimulationRouter from './routes/backtestSimulation.js';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -56,6 +60,7 @@ app.use(express.json());
 // Add the new Quant Backtest historical logic
 app.use('/api/quant-backtest', quantBacktestRouter);
 app.use('/api/data-loader', dataLoaderRouter);
+app.use('/api/backtest-simulation', backtestSimulationRouter);
 
 app.get('/api/yahoo-finance2', async (req, res) => {
     try {
@@ -65,7 +70,6 @@ app.get('/api/yahoo-finance2', async (req, res) => {
         }
 
         const yf = new yahooFinance();
-
         const endDate = new Date();
         const startDate = new Date();
         startDate.setFullYear(startDate.getFullYear() - 2);

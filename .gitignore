@@ -11,6 +11,8 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+
 
 # Editor directories and files
 .vscode/*
@@ -22,3 +24,13 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Temporary test scripts
+check_all_days.js
+check_trend.js
+debug_sim.js
+test_daily_check.js
+test_yf.js
+server_log.txt
+server_log2.txt
+backtest_results/

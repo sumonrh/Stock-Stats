@@ -95,7 +95,6 @@ router.post('/run', async (req, res) => {
 
         const allResults = [];
 
-        // 2. Fetch and process each ticker
         for (const ticker of tickers) {
             try {
                 const chart = await yf.chart(ticker, queryOptions);
